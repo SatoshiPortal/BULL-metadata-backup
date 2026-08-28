@@ -1187,7 +1187,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_saturation_fails_immediately_without_starving_fetch() -> Result<(), String> {
+    async fn store_in_flight_limit_does_not_affect_fetch() -> Result<(), String> {
         let (directory, owner, state) = test_state("in-flight")?;
         let held = Arc::clone(&state.store_in_flight)
             .acquire_many_owned(4)
@@ -1288,6 +1288,11 @@ mod tests {
         let backup_config = include_str!("../deploy/nginx/backup-server.conf");
         let fence_config = include_str!("../deploy/nginx/mutation-fence.conf");
         let cases = [
+            (
+                ApiError::InvalidRequest("Wallet backup request body is invalid."),
+                400,
+                backup_config,
+            ),
             (ApiError::BlobTooLarge, 413, backup_config),
             (
                 ApiError::RateLimited {
@@ -1337,7 +1342,6 @@ mod tests {
             "keepalive_requests 100;",
             "limit_req zone=backup_req_ip burst=20 nodelay;",
             "limit_conn backup_conn_ip 8;",
-            "limit_conn backup_conn_all 128;",
             "limit_req_status 429;",
             "limit_conn_status 429;",
             "limit_req_log_level info;",
@@ -1394,7 +1398,6 @@ mod tests {
             "limit_req_zone $server_name zone=backup_fetch_all:1m rate=6r/m;",
             "limit_req_zone $server_name zone=backup_mutation_all:1m rate=30r/m;",
             "limit_conn_zone $binary_remote_addr zone=backup_conn_ip:1m;",
-            "limit_conn_zone $server_name zone=backup_conn_all:1m;",
         ] {
             assert!(zones.contains(directive), "{directive}");
         }
@@ -1424,6 +1427,46 @@ mod tests {
             for directive in ["access_log off;", "error_log stderr crit;"] {
                 assert!(location.lines().any(|line| line.trim() == directive));
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nginx_fetch_capacity_is_isolated_from_mutations() -> Result<(), String> {
+        let config = include_str!("../deploy/nginx/backup-server.conf");
+        let zones = include_str!("../deploy/nginx/backup-server-http.conf");
+        for zone in ["backup_fetch_conn_all", "backup_mutation_conn_all"] {
+            assert!(zones.contains(&format!("zone={zone}:1m;")));
+        }
+        let fetch = nginx_exact_location(config, "/api/v1/wallet-backups/fetch")?;
+        assert!(fetch.contains("limit_conn backup_fetch_conn_all 96;"));
+        assert!(!fetch.contains("backup_mutation_conn_all"));
+        let mutation = nginx_exact_location(config, "/api/v1/wallet-backups")?;
+        assert!(mutation.contains("limit_conn backup_mutation_conn_all 32;"));
+        assert!(!mutation.contains("backup_fetch_conn_all"));
+        Ok(())
+    }
+
+    #[test]
+    fn nginx_backup_routes_require_bounded_fixed_length_bodies() -> Result<(), String> {
+        let config = include_str!("../deploy/nginx/backup-server.conf");
+        for path in ["/api/v1/wallet-backups/fetch", "/api/v1/wallet-backups"] {
+            let location = nginx_exact_location(config, path)?;
+            for directive in [
+                "if ($http_content_length = \"\") { return 400; }",
+                "if ($http_transfer_encoding != \"\") { return 400; }",
+                "error_page 400 = @backup_invalid_request;",
+                "proxy_request_buffering on;",
+            ] {
+                assert!(
+                    location.lines().any(|line| line.trim() == directive),
+                    "{path}: {directive}"
+                );
+            }
+        }
+        let rejection = nginx_named_location(config, "backup_invalid_request")?;
+        for directive in ["internal;", "access_log off;", "error_log stderr crit;"] {
+            assert!(rejection.lines().any(|line| line.trim() == directive));
         }
         Ok(())
     }

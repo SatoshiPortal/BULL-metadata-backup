@@ -1,0 +1,57 @@
+[Unit]
+Description=Opaque backup server
+After=network.target time-sync.target
+Wants=time-sync.target
+StartLimitIntervalSec=5min
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=backup-server
+Group=backup-server
+EnvironmentFile=/etc/backup-server.env
+ExecStart=/opt/backup-server/backup-server serve
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+StandardOutput=journal
+StandardError=journal
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=100
+MemoryAccounting=true
+CPUAccounting=true
+IOAccounting=true
+IPAccounting=true
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=true
+PrivateTmp=true
+ProtectHostname=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+RemoveIPC=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+ReadWritePaths=/var/lib/backup-server
+LimitCORE=0
+LimitNOFILE=1024
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target

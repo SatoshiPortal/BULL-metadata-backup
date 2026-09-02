@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-pub const VERSION: u8 = 2;
-pub const AUTH_DOMAIN: &[u8] = b"bullbitcoin-wallet-backup-v2";
+pub const VERSION: u8 = 1;
+pub const AUTH_DOMAIN: &[u8] = b"bullbitcoin-wallet-backup-v1";
 pub const ETAG_DOMAIN: &[u8] = b"bullbitcoin-wallet-backup-etag-v1";
 pub const ABSOLUTE_MAX_CIPHERTEXT_BYTES: usize = 1024 * 1024;
 pub const ABSOLUTE_MAX_STORE_BODY_BYTES: usize = 1536 * 1024;
@@ -44,7 +44,6 @@ impl BackupStream {
 #[serde(deny_unknown_fields)]
 pub struct FetchRequest {
     pub version: u8,
-    pub audience: String,
     pub stream: BackupStream,
     pub npub: String,
     pub timestamp: u64,
@@ -55,7 +54,6 @@ pub struct FetchRequest {
 #[serde(deny_unknown_fields)]
 pub struct StoreRequest {
     pub version: u8,
-    pub audience: String,
     pub stream: BackupStream,
     pub npub: String,
     pub generation: u64,
@@ -115,7 +113,6 @@ impl<'de> Deserialize<'de> for RequiredNullableString {
 #[serde(deny_unknown_fields)]
 pub struct DeleteRequest {
     pub version: u8,
-    pub audience: String,
     pub stream: BackupStream,
     pub npub: String,
     pub generation: u64,
@@ -283,7 +280,6 @@ pub fn validate_generation(generation: u64) -> Result<i64, ApiError> {
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_signing_message(
-    audience: &str,
     action: &str,
     stream: BackupStream,
     npub: &str,
@@ -297,7 +293,6 @@ pub fn build_signing_message(
     let ciphertext_bytes = ciphertext_bytes.to_string();
     let timestamp = timestamp.to_string();
     let fields = [
-        audience,
         action,
         stream.as_str(),
         npub,
@@ -342,7 +337,6 @@ pub fn compute_etag(
 
 #[allow(clippy::too_many_arguments)]
 pub fn verify_request_signature(
-    audience: &str,
     action: &str,
     stream: BackupStream,
     npub: &str,
@@ -362,7 +356,6 @@ pub fn verify_request_signature(
     let public_key = XOnlyPublicKey::from_str(npub).map_err(|_| ApiError::Authentication)?;
     let signature = secp256k1::schnorr::Signature::from_byte_array(signature_bytes);
     let digest: [u8; 32] = Sha256::digest(build_signing_message(
-        audience,
         action,
         stream,
         npub,
@@ -406,11 +399,9 @@ mod tests {
 
     const NPUB: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
     const HASH: &str = "ae4b3280e56e2faf83f414a6e3dabe9d5fbe18976544c05fed121accb85b53fc";
-    const AUDIENCE: &str = "https://backup.example.com";
 
     #[derive(Deserialize)]
     struct Fixture {
-        audience: String,
         npub: String,
         protocol: String,
         tamper_cases: Vec<TamperCase>,
@@ -441,7 +432,6 @@ mod tests {
     #[test]
     fn signing_message_format() {
         let message = build_signing_message(
-            AUDIENCE,
             STORE_ACTION,
             BackupStream::WalletBackup,
             NPUB,
@@ -452,7 +442,7 @@ mod tests {
             1_700_000_000,
         );
         let expected = concat!(
-            "bullbitcoin-wallet-backup-v2\0https://backup.example.com\0backup-store\0wallet_backup\0",
+            "bullbitcoin-wallet-backup-v1\0backup-store\0wallet_backup\0",
             "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798\0",
             "1\0\0ae4b3280e56e2faf83f414a6e3dabe9d5fbe18976544c05fed121accb85b53fc\0",
             "4\01700000000"
@@ -482,8 +472,7 @@ mod tests {
     #[test]
     fn nullable_etag_must_be_present() {
         let body = serde_json::json!({
-            "version": 2,
-            "audience": AUDIENCE,
+            "version": 1,
             "stream": "wallet_backup",
             "npub": NPUB,
             "generation": 1,
@@ -514,16 +503,16 @@ mod tests {
 
     #[test]
     fn protocol_vectors_match() -> Result<(), String> {
-        let fixture_bytes = include_bytes!("../tests/fixtures/wallet-backup-v2.json");
+        let fixture_bytes = include_bytes!("../tests/fixtures/wallet-backup-v1.json");
         assert_eq!(
             hex::encode(Sha256::digest(fixture_bytes)),
-            "9e2a18990a4ae95e1bde4de675b1b5728a4906e3b05170a0f76f5692c80898ce"
+            "84b64d530c407c28df32bd3ef659842152784874595f28ebaaed250227404da1"
         );
         let fixture: Fixture = serde_json::from_slice(fixture_bytes)
             .map_err(|_| "invalid protocol fixture".to_owned())?;
-        assert_eq!(fixture.protocol, "bullbitcoin-wallet-backup-v2");
+        assert_eq!(fixture.protocol, "bullbitcoin-wallet-backup-v1");
         assert_eq!(fixture.vectors.len(), 7);
-        assert_eq!(fixture.tamper_cases.len(), 9);
+        assert_eq!(fixture.tamper_cases.len(), 8);
         assert_eq!(
             fixture
                 .tamper_cases
@@ -531,7 +520,6 @@ mod tests {
                 .map(|case| (case.field.as_str(), case.expected_code.as_str()))
                 .collect::<Vec<_>>(),
             [
-                ("audience", "BackupAuthError"),
                 ("action", "BackupAuthError"),
                 ("stream", "BackupInvalidRequest"),
                 ("generation", "BackupAuthError"),
@@ -544,7 +532,6 @@ mod tests {
         );
         for vector in fixture.vectors {
             let message = build_signing_message(
-                &fixture.audience,
                 &vector.action,
                 BackupStream::WalletBackup,
                 &fixture.npub,
@@ -560,7 +547,6 @@ mod tests {
                 vector.signed_message_sha256
             );
             verify_request_signature(
-                &fixture.audience,
                 &vector.action,
                 BackupStream::WalletBackup,
                 &fixture.npub,

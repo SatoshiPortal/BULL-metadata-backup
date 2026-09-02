@@ -11,8 +11,9 @@ use crate::protocol::{
 };
 
 const PREFIX: &str = "BACKUP_SERVER_";
-const KNOWN: [&str; 33] = [
+const KNOWN: [&str; 34] = [
     "BACKUP_SERVER_BIND",
+    "BACKUP_SERVER_AUTH_AUDIENCE",
     "BACKUP_SERVER_DB_PATH",
     "BACKUP_SERVER_MAX_LIVE_BYTES",
     "BACKUP_SERVER_MAX_HEADS",
@@ -79,6 +80,7 @@ pub struct AdmissionConfig {
 #[derive(Clone)]
 pub struct Config {
     pub bind: SocketAddr,
+    pub auth_audience: String,
     pub db_path: PathBuf,
     pub max_live_bytes: u64,
     pub max_heads: u64,
@@ -110,6 +112,13 @@ impl Config {
             .map_err(|_| "BACKUP_SERVER_BIND must be a socket address".to_owned())?;
         if !bind.ip().is_loopback() {
             return Err("BACKUP_SERVER_BIND must use a loopback address".to_owned());
+        }
+        let auth_audience = required("BACKUP_SERVER_AUTH_AUDIENCE")?;
+        if auth_audience.as_bytes().contains(&0) || auth_audience.len() > 255 {
+            return Err(
+                "BACKUP_SERVER_AUTH_AUDIENCE must be at most 255 UTF-8 bytes and contain no NUL"
+                    .to_owned(),
+            );
         }
         let db_path = PathBuf::from(required("BACKUP_SERVER_DB_PATH")?);
         if !db_path.is_absolute() {
@@ -260,6 +269,7 @@ impl Config {
 
         Ok(Self {
             bind,
+            auth_audience,
             db_path,
             max_live_bytes,
             max_heads,

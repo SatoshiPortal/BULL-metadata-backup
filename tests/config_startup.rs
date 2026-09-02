@@ -5,6 +5,7 @@ fn invalid_startup(overrides: &[(&str, &str)]) -> Result<String, String> {
     command
         .arg("serve")
         .env_clear()
+        .env("BACKUP_SERVER_AUTH_AUDIENCE", "https://backup.example.com")
         .env("BACKUP_SERVER_DB_PATH", "/tmp/unused-backup.sqlite3")
         .env("BACKUP_SERVER_MAX_LIVE_BYTES", "100000000000")
         .env("BACKUP_SERVER_MAX_HEADS", "90000")
@@ -21,6 +22,17 @@ fn invalid_startup(overrides: &[(&str, &str)]) -> Result<String, String> {
     let mut bytes = output.stdout;
     bytes.extend_from_slice(&output.stderr);
     String::from_utf8(bytes).map_err(|_| "startup error was not UTF-8".to_owned())
+}
+
+#[test]
+fn invalid_authentication_audience_fails_startup() -> Result<(), String> {
+    let missing = invalid_startup(&[("BACKUP_SERVER_AUTH_AUDIENCE", "")])?;
+    assert!(missing.contains("BACKUP_SERVER_AUTH_AUDIENCE is required"));
+
+    let oversized = "x".repeat(256);
+    let oversized = invalid_startup(&[("BACKUP_SERVER_AUTH_AUDIENCE", &oversized)])?;
+    assert!(oversized.contains("must be at most 255 UTF-8 bytes"));
+    Ok(())
 }
 
 #[test]

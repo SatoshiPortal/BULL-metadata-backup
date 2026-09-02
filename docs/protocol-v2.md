@@ -1,18 +1,15 @@
-# Wallet backup protocol v1
+# Wallet backup protocol v2
 
-Protocol v1 is frozen: deployed clients already implement it. The compatibility
-baseline is Bullnym commit `e3c4767d3d7b9c7b278af45299bb78ad8160dc50` and the
-backup portion of Bull Bitcoin Mobile PR 2738 at
-`f49759f00b7c8bbb352ac8ca273db004636ff878`. Wire changes require a new protocol
-version, not an amendment to this one.
+Protocol v2 binds every signature to the server's configured public origin.
+The server accepts v2 only; no released mobile client used protocol v1.
 
 ## Constants
 
 | Name | Value |
 |---|---|
-| Version | `1` |
+| Version | `2` |
 | Stream | `wallet_backup` |
-| Authentication domain | `bullbitcoin-wallet-backup-v1` |
+| Authentication domain | `bullbitcoin-wallet-backup-v2` |
 | ETag domain | `bullbitcoin-wallet-backup-etag-v1` |
 | Timestamp window | inclusive ±300 seconds |
 | Decoded ciphertext maximum | 1,048,576 bytes |
@@ -25,7 +22,8 @@ version, not an amendment to this one.
 Each request signs SHA-256 of this NUL-separated byte sequence with BIP340:
 
 ```text
-bullbitcoin-wallet-backup-v1
+bullbitcoin-wallet-backup-v2
+audience
 action
 wallet_backup
 npub
@@ -36,9 +34,11 @@ ciphertext_bytes
 timestamp
 ```
 
-There is one NUL byte before each field after the domain. Integers use minimal
-unsigned decimal ASCII. Fetch signs generation and byte count as zero. Delete
-signs an empty ciphertext hash and zero byte count.
+There is one NUL byte before each field after the domain. `audience` is the
+exact server origin configured by the operator and sent by the client. The
+server rejects any other value before signature verification. Integers use
+minimal unsigned decimal ASCII. Fetch signs generation and byte count as zero.
+Delete signs an empty ciphertext hash and zero byte count.
 
 Actions are `backup-fetch`, `backup-store`, and `backup-delete`.
 
@@ -81,11 +81,9 @@ Tombstones use an empty ciphertext hash.
   signature. Do not re-encrypt a retry with a fresh nonce.
 - Clients SHOULD treat `Retry-After` as a minimum delay and add only upward
   scheduling jitter.
-- After a store, clients SHOULD fetch the head back, confirm the generation,
-  ETag, and ciphertext hash, and check that the returned ciphertext decrypts.
-  The service retains no previous generation, so a corrupt upload replaces the
-  only server copy; immediately after the store, while the local plaintext
-  still exists, is the only moment that loss is recoverable.
+- Clients SHOULD validate the mutation receipt's generation, ETag, and
+  ciphertext hash. Success is returned only after the SQLite transaction
+  commits; a second full download is not required after every store.
 
 These recommendations reduce honest traffic, preserve exact-retry behavior,
 and protect backup usability; server-side limits remain the enforcement and
@@ -119,4 +117,4 @@ The JSON error object is:
 {"code":"...","reason":"...","status":"ERROR"}
 ```
 
-Protocol vectors are in `tests/fixtures/wallet-backup-v1.json`.
+Protocol vectors are in `tests/fixtures/wallet-backup-v2.json`.

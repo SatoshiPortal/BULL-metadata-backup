@@ -22,15 +22,18 @@ loopback and has no outbound network client or administrative API.
 
 ```sh
 export BACKUP_SERVER_DB_PATH=/var/lib/backup-server/backup.sqlite3
+export BACKUP_SERVER_AUTH_AUDIENCE=https://backup.bull-wallet.com
 export BACKUP_SERVER_MAX_LIVE_BYTES=<bytes>
 export BACKUP_SERVER_MAX_HEADS=<count>
 export BACKUP_SERVER_LIMITER_MAX_SUBJECTS=<count>
 backup-server serve
 ```
 
-Four variables are required: `BACKUP_SERVER_DB_PATH`,
-`BACKUP_SERVER_MAX_LIVE_BYTES`, `BACKUP_SERVER_MAX_HEADS`, and
-`BACKUP_SERVER_LIMITER_MAX_SUBJECTS`. The optional variables — object size
+Five variables are required: `BACKUP_SERVER_DB_PATH`,
+`BACKUP_SERVER_AUTH_AUDIENCE`, `BACKUP_SERVER_MAX_LIVE_BYTES`,
+`BACKUP_SERVER_MAX_HEADS`, and `BACKUP_SERVER_LIMITER_MAX_SUBJECTS`.
+`BACKUP_SERVER_AUTH_AUDIENCE` is the exact public origin clients sign; it must
+match the reverse proxy origin. The optional variables — object size
 ceilings, rate windows, admission budgets, concurrency, timeouts, and log
 level — are enumerated with their development defaults in `src/config.rs`.
 Production limits are set in the deployment environment and are not
@@ -83,5 +86,5 @@ cargo doc --no-deps --document-private-items --locked
 cargo audit
 ```
 
-See [docs/protocol-v1.md](docs/protocol-v1.md) for the wire contract and
+See [docs/protocol-v2.md](docs/protocol-v2.md) for the wire contract and
 [SECURITY.md](SECURITY.md) for the security boundary.

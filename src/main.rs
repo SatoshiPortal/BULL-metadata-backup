@@ -41,6 +41,7 @@ const SOURCE_IDENTITY_HEADER: &str = "x-real-ip";
 
 #[derive(Clone)]
 struct AppState {
+    auth_audience: Arc<str>,
     storage: Storage,
     limiter: RateLimiter,
     fetch_in_flight: Arc<Semaphore>,
@@ -229,6 +230,7 @@ async fn serve(config: config::Config) -> Result<(), String> {
     })?;
     let storage = owner.client();
     let state = AppState {
+        auth_audience: Arc::from(config.auth_audience),
         storage: storage.clone(),
         limiter,
         fetch_in_flight: Arc::new(Semaphore::new(config.fetch_max_in_flight)),
@@ -515,11 +517,15 @@ async fn fetch_inner(
     source_identity(headers)?;
     let request: FetchRequest = json_request(request, state).await?;
     validate_version(request.version)?;
+    if request.audience != state.auth_audience.as_ref() {
+        return Err(ApiError::Authentication);
+    }
     let author = decode_canonical_hex::<32>(
         &request.npub,
         "Wallet backup public key must be 64 lowercase hexadecimal characters.",
     )?;
     verify_request_signature(
+        &request.audience,
         FETCH_ACTION,
         request.stream,
         &request.npub,
@@ -607,6 +613,9 @@ async fn store_inner(
     source_identity(headers)?;
     let request: StoreRequest = json_request(request, state).await?;
     validate_version(request.version)?;
+    if request.audience != state.auth_audience.as_ref() {
+        return Err(ApiError::Authentication);
+    }
     let generation = validate_generation(request.generation)?;
     let author = decode_canonical_hex::<32>(
         &request.npub,
@@ -622,6 +631,7 @@ async fn store_inner(
         "Wallet backup ciphertext hash is invalid.",
     )?;
     verify_request_signature(
+        &request.audience,
         STORE_ACTION,
         request.stream,
         &request.npub,
@@ -723,6 +733,9 @@ async fn delete_inner(
     source_identity(headers)?;
     let request: DeleteRequest = json_request(request, state).await?;
     validate_version(request.version)?;
+    if request.audience != state.auth_audience.as_ref() {
+        return Err(ApiError::Authentication);
+    }
     let generation = validate_generation(request.generation)?;
     let author = decode_canonical_hex::<32>(
         &request.npub,
@@ -731,6 +744,7 @@ async fn delete_inner(
     let expected_etag =
         decode_canonical_hex::<32>(&request.expected_etag, "Wallet backup ETag is invalid.")?;
     verify_request_signature(
+        &request.audience,
         DELETE_ACTION,
         request.stream,
         &request.npub,
@@ -792,6 +806,8 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
     use tower::ServiceExt;
+
+    const TEST_AUDIENCE: &str = "https://backup.example.com";
 
     #[derive(Clone)]
     struct TestLogWriter(Arc<Mutex<Vec<u8>>>);
@@ -874,6 +890,7 @@ mod tests {
             admission: test_admission(),
         })?;
         let state = AppState {
+            auth_audience: Arc::from(TEST_AUDIENCE),
             storage: owner.client(),
             limiter: RateLimiter::new(test_limiter())?,
             fetch_in_flight: Arc::new(Semaphore::new(4)),
@@ -1049,6 +1066,7 @@ mod tests {
             let keypair = Keypair::from_secret_key(&secp, &secret);
             let npub = keypair.x_only_public_key().0.to_string();
             let message = build_signing_message(
+                TEST_AUDIENCE,
                 FETCH_ACTION,
                 BackupStream::WalletBackup,
                 &npub,
@@ -1061,7 +1079,8 @@ mod tests {
             let digest: [u8; 32] = Sha256::digest(message).into();
             let signature = secp.sign_schnorr_no_aux_rand(&digest, &keypair).to_string();
             let body = serde_json::json!({
-                "version": 1,
+                "version": 2,
+                "audience": TEST_AUDIENCE,
                 "stream": "wallet_backup",
                 "npub": npub,
                 "timestamp": timestamp,
@@ -1484,6 +1503,7 @@ mod tests {
         let ciphertext = "AAECAw==";
         let ciphertext_hash = "054edec1d0211f624fed0cbca9d4f9400b0e491c43742af2c5b0abebf0c990d8";
         let store_message = build_signing_message(
+            TEST_AUDIENCE,
             STORE_ACTION,
             BackupStream::WalletBackup,
             &npub,
@@ -1498,7 +1518,8 @@ mod tests {
             .sign_schnorr_no_aux_rand(&store_digest, &keypair)
             .to_string();
         let store_body = serde_json::json!({
-            "version": 1,
+            "version": 2,
+            "audience": TEST_AUDIENCE,
             "stream": "wallet_backup",
             "npub": npub,
             "generation": 1,
@@ -1545,6 +1566,7 @@ mod tests {
         );
 
         let fetch_message = build_signing_message(
+            TEST_AUDIENCE,
             FETCH_ACTION,
             BackupStream::WalletBackup,
             &npub,
@@ -1559,7 +1581,8 @@ mod tests {
             .sign_schnorr_no_aux_rand(&fetch_digest, &keypair)
             .to_string();
         let fetch_body = serde_json::json!({
-            "version": 1,
+            "version": 2,
+            "audience": TEST_AUDIENCE,
             "stream": "wallet_backup",
             "npub": npub,
             "timestamp": timestamp,
@@ -1612,7 +1635,8 @@ mod tests {
         let npub = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
         let hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         let oversized = serde_json::json!({
-            "version": 1,
+            "version": 2,
+            "audience": TEST_AUDIENCE,
             "stream": "wallet_backup",
             "npub": npub,
             "generation": 1,
@@ -1643,6 +1667,7 @@ mod tests {
             .map_err(|_| "invalid test secret".to_owned())?;
         let keypair = Keypair::from_secret_key(&secp, &secret);
         let oversized_message = build_signing_message(
+            TEST_AUDIENCE,
             STORE_ACTION,
             BackupStream::WalletBackup,
             npub,
@@ -1681,7 +1706,8 @@ mod tests {
         );
 
         let malformed = serde_json::json!({
-            "version": 1,
+            "version": 2,
+            "audience": TEST_AUDIENCE,
             "stream": "wallet_backup",
             "npub": npub,
             "generation": 1,
@@ -1714,10 +1740,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signature_for_one_audience_is_rejected_by_another() -> Result<(), String> {
+        let (directory, owner, mut state) = test_state("wrong-audience")?;
+        let secp = Secp256k1::new();
+        let secret =
+            SecretKey::from_byte_array([1_u8; 32]).map_err(|_| "invalid test secret".to_owned())?;
+        let keypair = Keypair::from_secret_key(&secp, &secret);
+        let npub = keypair.x_only_public_key().0.to_string();
+        let timestamp = unix_time().map_err(|_| "clock unavailable".to_owned())?;
+        let digest: [u8; 32] = Sha256::digest(build_signing_message(
+            TEST_AUDIENCE,
+            FETCH_ACTION,
+            BackupStream::WalletBackup,
+            &npub,
+            0,
+            None,
+            None,
+            0,
+            timestamp,
+        ))
+        .into();
+        let signature = secp.sign_schnorr_no_aux_rand(&digest, &keypair).to_string();
+        let body = serde_json::json!({
+            "version": 2,
+            "audience": TEST_AUDIENCE,
+            "stream": "wallet_backup",
+            "npub": npub,
+            "timestamp": timestamp,
+            "signature": signature,
+        });
+        state.auth_audience = Arc::from("https://other.example.com");
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/wallet-backups/fetch")
+            .header("content-type", "application/json")
+            .header("x-real-ip", "192.0.2.4")
+            .body(Body::from(body.to_string()))
+            .map_err(|_| "failed to build wrong-audience request".to_owned())?;
+        let response = test_router(state)
+            .oneshot(request)
+            .await
+            .map_err(|_| "wrong-audience router failed".to_owned())?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        owner.shutdown().await?;
+        fs::remove_dir_all(directory).map_err(|_| "failed to clean test directory".to_owned())?;
+        Ok(())
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn tamper_matrix_matches_http_errors() -> Result<(), String> {
         let fixture: TamperFixture =
-            serde_json::from_str(include_str!("../tests/fixtures/wallet-backup-v1.json"))
+            serde_json::from_str(include_str!("../tests/fixtures/wallet-backup-v2.json"))
                 .map_err(|_| "invalid tamper fixture".to_owned())?;
         let secret_bytes: [u8; 32] = hex::decode(&fixture.test_only_secret_key)
             .map_err(|_| "invalid fixture secret".to_owned())?
@@ -1734,6 +1810,7 @@ mod tests {
         let ciphertext_hash = hex::encode(Sha256::digest(ciphertext));
         let timestamp = unix_time().map_err(|_| "clock unavailable".to_owned())?;
         let baseline_message = build_signing_message(
+            TEST_AUDIENCE,
             STORE_ACTION,
             BackupStream::WalletBackup,
             &fixture.npub,
@@ -1748,7 +1825,8 @@ mod tests {
             .sign_schnorr_no_aux_rand(&baseline_digest, &keypair)
             .to_string();
         let baseline = serde_json::json!({
-            "version": 1,
+            "version": 2,
+            "audience": TEST_AUDIENCE,
             "stream": "wallet_backup",
             "npub": fixture.npub.clone(),
             "generation": 1,
@@ -1769,6 +1847,7 @@ mod tests {
             let (method, body) = if tamper.field == "action" {
                 let expected_etag = "11".repeat(32);
                 let message = build_signing_message(
+                    TEST_AUDIENCE,
                     STORE_ACTION,
                     BackupStream::WalletBackup,
                     &fixture.npub,
@@ -1783,7 +1862,8 @@ mod tests {
                 (
                     "DELETE",
                     serde_json::json!({
-                        "version": 1,
+                        "version": 2,
+                        "audience": TEST_AUDIENCE,
                         "stream": "wallet_backup",
                         "npub": fixture.npub.clone(),
                         "generation": 1,
@@ -1795,6 +1875,13 @@ mod tests {
             } else {
                 let mut body = baseline.clone();
                 match tamper.field.as_str() {
+                    "audience" => {
+                        replace_json_field(
+                            &mut body,
+                            "audience",
+                            serde_json::Value::String("https://other.example.com".to_owned()),
+                        )?;
+                    }
                     "stream" => {
                         replace_json_field(
                             &mut body,
@@ -1815,6 +1902,7 @@ mod tests {
                     "ciphertext_sha256" => {
                         let tampered_hash = "33".repeat(32);
                         let message = build_signing_message(
+                            TEST_AUDIENCE,
                             STORE_ACTION,
                             BackupStream::WalletBackup,
                             &fixture.npub,
@@ -1840,6 +1928,7 @@ mod tests {
                     }
                     "ciphertext_bytes" => {
                         let message = build_signing_message(
+                            TEST_AUDIENCE,
                             STORE_ACTION,
                             BackupStream::WalletBackup,
                             &fixture.npub,

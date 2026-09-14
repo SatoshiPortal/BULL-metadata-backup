@@ -6,12 +6,14 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::protocol::{
-    ABSOLUTE_MAX_CIPHERTEXT_BYTES, ABSOLUTE_MAX_STORE_BODY_BYTES, MIN_TOMBSTONE_RETENTION_SECS,
+    ABSOLUTE_MAX_CIPHERTEXT_BYTES, ABSOLUTE_MAX_DESCRIPTOR_CIPHERTEXT_BYTES,
+    ABSOLUTE_MAX_DESCRIPTOR_STORE_BODY_BYTES, ABSOLUTE_MAX_STORE_BODY_BYTES,
+    DESCRIPTOR_STORE_ENVELOPE_HEADROOM_BYTES, MIN_TOMBSTONE_RETENTION_SECS,
     STORE_ENVELOPE_HEADROOM_BYTES,
 };
 
 const PREFIX: &str = "BACKUP_SERVER_";
-const KNOWN: [&str; 33] = [
+const KNOWN: [&str; 45] = [
     "BACKUP_SERVER_BIND",
     "BACKUP_SERVER_DB_PATH",
     "BACKUP_SERVER_MAX_LIVE_BYTES",
@@ -45,6 +47,18 @@ const KNOWN: [&str; 33] = [
     "BACKUP_SERVER_SHUTDOWN_TIMEOUT_SECS",
     "BACKUP_SERVER_REQUEST_TOTALS_INTERVAL_SECS",
     "BACKUP_SERVER_LOG",
+    "BACKUP_SERVER_ACCEPTED_DESCRIPTOR_CIPHERTEXT_BYTES",
+    "BACKUP_SERVER_DESCRIPTOR_STORE_BODY_LIMIT_BYTES",
+    "BACKUP_SERVER_MAX_DESCRIPTOR_RECORDS",
+    "BACKUP_SERVER_MAX_DESCRIPTOR_RECORDS_PER_PUBLISHER",
+    "BACKUP_SERVER_DESCRIPTOR_STORE_MAX_IN_FLIGHT",
+    "BACKUP_SERVER_DESCRIPTOR_LOOKUP_MAX_IN_FLIGHT",
+    "BACKUP_SERVER_DESCRIPTOR_LOOKUP_RECORD_CAP",
+    "BACKUP_SERVER_DESCRIPTOR_LOOKUP_MAX_BYTES",
+    "BACKUP_SERVER_DESCRIPTOR_STORE_NPUB_LIMIT",
+    "BACKUP_SERVER_DESCRIPTOR_STORE_NPUB_WINDOW_SECS",
+    "BACKUP_SERVER_DESCRIPTOR_LOOKUP_LIMIT",
+    "BACKUP_SERVER_DESCRIPTOR_LOOKUP_WINDOW_SECS",
 ];
 
 #[derive(Clone, Copy)]
@@ -61,6 +75,8 @@ pub struct LimiterConfig {
     pub prune_interval: Duration,
     pub fetch_npub: WindowLimit,
     pub mutation_npub: WindowLimit,
+    pub descriptor_store_npub: WindowLimit,
+    pub descriptor_lookup: WindowLimit,
 }
 
 #[derive(Clone, Copy)]
@@ -84,6 +100,14 @@ pub struct Config {
     pub max_heads: u64,
     pub accepted_ciphertext_bytes: usize,
     pub store_body_limit_bytes: usize,
+    pub accepted_descriptor_ciphertext_bytes: usize,
+    pub descriptor_store_body_limit_bytes: usize,
+    pub max_descriptor_records: u64,
+    pub max_descriptor_records_per_publisher: u64,
+    pub descriptor_lookup_record_cap: usize,
+    pub descriptor_lookup_max_bytes: u64,
+    pub descriptor_store_max_in_flight: usize,
+    pub descriptor_lookup_max_in_flight: usize,
     pub limiter: LimiterConfig,
     pub storage_queue_depth: usize,
     pub fetch_max_in_flight: usize,
@@ -135,12 +159,7 @@ impl Config {
                 "BACKUP_SERVER_STORE_BODY_LIMIT_BYTES must be at most {ABSOLUTE_MAX_STORE_BODY_BYTES}"
             ));
         }
-        let encoded_ciphertext = accepted_ciphertext_bytes
-            .checked_add(2)
-            .and_then(|value| value.checked_div(3))
-            .and_then(|value| value.checked_mul(4))
-            .ok_or_else(|| "configured ciphertext size is out of range".to_owned())?;
-        let minimum_store_body = encoded_ciphertext
+        let minimum_store_body = encoded_size(accepted_ciphertext_bytes)?
             .checked_add(STORE_ENVELOPE_HEADROOM_BYTES)
             .ok_or_else(|| "configured store body size is out of range".to_owned())?;
         if store_body_limit_bytes < minimum_store_body {
@@ -156,6 +175,54 @@ impl Config {
         if maximum_live_shape > max_live_bytes {
             return Err(
                 "BACKUP_SERVER_MAX_HEADS times BACKUP_SERVER_ACCEPTED_CIPHERTEXT_BYTES must not exceed BACKUP_SERVER_MAX_LIVE_BYTES"
+                    .to_owned(),
+            );
+        }
+
+        let accepted_descriptor_ciphertext_bytes = optional_usize(
+            "BACKUP_SERVER_ACCEPTED_DESCRIPTOR_CIPHERTEXT_BYTES",
+            ABSOLUTE_MAX_DESCRIPTOR_CIPHERTEXT_BYTES,
+        )?;
+        if accepted_descriptor_ciphertext_bytes > ABSOLUTE_MAX_DESCRIPTOR_CIPHERTEXT_BYTES {
+            return Err(format!(
+                "BACKUP_SERVER_ACCEPTED_DESCRIPTOR_CIPHERTEXT_BYTES must be at most {ABSOLUTE_MAX_DESCRIPTOR_CIPHERTEXT_BYTES}"
+            ));
+        }
+        let descriptor_store_body_limit_bytes = optional_usize(
+            "BACKUP_SERVER_DESCRIPTOR_STORE_BODY_LIMIT_BYTES",
+            ABSOLUTE_MAX_DESCRIPTOR_STORE_BODY_BYTES,
+        )?;
+        if descriptor_store_body_limit_bytes > ABSOLUTE_MAX_DESCRIPTOR_STORE_BODY_BYTES {
+            return Err(format!(
+                "BACKUP_SERVER_DESCRIPTOR_STORE_BODY_LIMIT_BYTES must be at most {ABSOLUTE_MAX_DESCRIPTOR_STORE_BODY_BYTES}"
+            ));
+        }
+        let minimum_descriptor_body = encoded_size(accepted_descriptor_ciphertext_bytes)?
+            .checked_add(DESCRIPTOR_STORE_ENVELOPE_HEADROOM_BYTES)
+            .ok_or_else(|| "configured descriptor body size is out of range".to_owned())?;
+        if descriptor_store_body_limit_bytes < minimum_descriptor_body {
+            return Err(format!(
+                "BACKUP_SERVER_DESCRIPTOR_STORE_BODY_LIMIT_BYTES must be at least {minimum_descriptor_body} for the configured descriptor ciphertext size"
+            ));
+        }
+        let max_descriptor_records = optional_u64("BACKUP_SERVER_MAX_DESCRIPTOR_RECORDS", 100_000)?;
+        let max_descriptor_records_per_publisher =
+            optional_u64("BACKUP_SERVER_MAX_DESCRIPTOR_RECORDS_PER_PUBLISHER", 64)?;
+        if max_descriptor_records_per_publisher > max_descriptor_records {
+            return Err(
+                "BACKUP_SERVER_MAX_DESCRIPTOR_RECORDS_PER_PUBLISHER must not exceed BACKUP_SERVER_MAX_DESCRIPTOR_RECORDS"
+                    .to_owned(),
+            );
+        }
+        let descriptor_lookup_record_cap =
+            optional_usize("BACKUP_SERVER_DESCRIPTOR_LOOKUP_RECORD_CAP", 32)?;
+        let descriptor_lookup_max_bytes =
+            optional_u64("BACKUP_SERVER_DESCRIPTOR_LOOKUP_MAX_BYTES", 512 * 1024)?;
+        let accepted_descriptor_u64 = u64::try_from(accepted_descriptor_ciphertext_bytes)
+            .map_err(|_| "configured descriptor ciphertext size is out of range".to_owned())?;
+        if descriptor_lookup_max_bytes < accepted_descriptor_u64 {
+            return Err(
+                "BACKUP_SERVER_DESCRIPTOR_LOOKUP_MAX_BYTES must admit one maximum-size descriptor record"
                     .to_owned(),
             );
         }
@@ -188,19 +255,37 @@ impl Config {
                 "BACKUP_SERVER_MUTATION_NPUB_WINDOW_SECS",
                 3_600,
             )?,
+            descriptor_store_npub: window_limit(
+                "BACKUP_SERVER_DESCRIPTOR_STORE_NPUB_LIMIT",
+                20,
+                "BACKUP_SERVER_DESCRIPTOR_STORE_NPUB_WINDOW_SECS",
+                3_600,
+            )?,
+            descriptor_lookup: window_limit(
+                "BACKUP_SERVER_DESCRIPTOR_LOOKUP_LIMIT",
+                60,
+                "BACKUP_SERVER_DESCRIPTOR_LOOKUP_WINDOW_SECS",
+                3_600,
+            )?,
         };
 
         let storage_queue_depth = optional_usize("BACKUP_SERVER_STORAGE_QUEUE_DEPTH", 64)?;
         let fetch_max_in_flight = optional_usize("BACKUP_SERVER_FETCH_MAX_IN_FLIGHT", 24)?;
         let store_max_in_flight = optional_usize("BACKUP_SERVER_STORE_MAX_IN_FLIGHT", 8)?;
         let delete_max_in_flight = optional_usize("BACKUP_SERVER_DELETE_MAX_IN_FLIGHT", 4)?;
+        let descriptor_store_max_in_flight =
+            optional_usize("BACKUP_SERVER_DESCRIPTOR_STORE_MAX_IN_FLIGHT", 4)?;
+        let descriptor_lookup_max_in_flight =
+            optional_usize("BACKUP_SERVER_DESCRIPTOR_LOOKUP_MAX_IN_FLIGHT", 8)?;
         let total_permits = fetch_max_in_flight
             .checked_add(store_max_in_flight)
             .and_then(|value| value.checked_add(delete_max_in_flight))
+            .and_then(|value| value.checked_add(descriptor_store_max_in_flight))
+            .and_then(|value| value.checked_add(descriptor_lookup_max_in_flight))
             .ok_or_else(|| "configured concurrency is out of range".to_owned())?;
         if storage_queue_depth <= total_permits {
             return Err(
-                "BACKUP_SERVER_STORAGE_QUEUE_DEPTH must be greater than the sum of fetch, store, and delete in-flight limits"
+                "BACKUP_SERVER_STORAGE_QUEUE_DEPTH must be greater than the sum of every in-flight limit"
                     .to_owned(),
             );
         }
@@ -231,7 +316,9 @@ impl Config {
         };
         let accepted_u64 = u64::try_from(accepted_ciphertext_bytes)
             .map_err(|_| "configured ciphertext size is out of range".to_owned())?;
-        if admission.total_growth_bytes.capacity < accepted_u64 {
+        if admission.total_growth_bytes.capacity < accepted_u64
+            || admission.total_growth_bytes.capacity < accepted_descriptor_u64
+        {
             return Err(
                 "total-growth admission capacity must admit one maximum-size ciphertext".to_owned(),
             );
@@ -265,6 +352,14 @@ impl Config {
             max_heads,
             accepted_ciphertext_bytes,
             store_body_limit_bytes,
+            accepted_descriptor_ciphertext_bytes,
+            descriptor_store_body_limit_bytes,
+            max_descriptor_records,
+            max_descriptor_records_per_publisher,
+            descriptor_lookup_record_cap,
+            descriptor_lookup_max_bytes,
+            descriptor_store_max_in_flight,
+            descriptor_lookup_max_in_flight,
             limiter,
             storage_queue_depth,
             fetch_max_in_flight,
@@ -281,6 +376,15 @@ impl Config {
             request_totals_interval,
         })
     }
+}
+
+/// Base64 length of `bytes` plain bytes, rounded up to the padded block.
+fn encoded_size(bytes: usize) -> Result<usize, String> {
+    bytes
+        .checked_add(2)
+        .and_then(|value| value.checked_div(3))
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| "configured ciphertext size is out of range".to_owned())
 }
 
 pub fn log_level() -> Result<String, String> {

@@ -62,3 +62,36 @@ fn contradictory_capacity_and_admission_configuration_fails_startup() -> Result<
     assert!(removed_variable.contains("unknown configuration variable"));
     Ok(())
 }
+
+#[test]
+fn contradictory_descriptor_configuration_fails_startup() -> Result<(), String> {
+    let oversized = invalid_startup(&[(
+        "BACKUP_SERVER_ACCEPTED_DESCRIPTOR_CIPHERTEXT_BYTES",
+        "65537",
+    )])?;
+    assert!(oversized.contains("must be at most 65536"));
+
+    let undersized_body =
+        invalid_startup(&[("BACKUP_SERVER_DESCRIPTOR_STORE_BODY_LIMIT_BYTES", "87385")])?;
+    assert!(undersized_body.contains("must be at least"));
+
+    let inverted_quota = invalid_startup(&[
+        ("BACKUP_SERVER_MAX_DESCRIPTOR_RECORDS", "10"),
+        ("BACKUP_SERVER_MAX_DESCRIPTOR_RECORDS_PER_PUBLISHER", "11"),
+    ])?;
+    assert!(inverted_quota.contains("must not exceed BACKUP_SERVER_MAX_DESCRIPTOR_RECORDS"));
+
+    let undersized_lookup_budget =
+        invalid_startup(&[("BACKUP_SERVER_DESCRIPTOR_LOOKUP_MAX_BYTES", "65535")])?;
+    assert!(undersized_lookup_budget.contains("must admit one maximum-size descriptor record"));
+
+    let queue_without_headroom = invalid_startup(&[
+        ("BACKUP_SERVER_STORAGE_QUEUE_DEPTH", "48"),
+        ("BACKUP_SERVER_DESCRIPTOR_STORE_MAX_IN_FLIGHT", "4"),
+        ("BACKUP_SERVER_DESCRIPTOR_LOOKUP_MAX_IN_FLIGHT", "8"),
+    ])?;
+    assert!(
+        queue_without_headroom.contains("must be greater than the sum of every in-flight limit")
+    );
+    Ok(())
+}

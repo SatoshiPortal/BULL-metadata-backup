@@ -3,8 +3,21 @@
 ## Boundary
 
 The service accepts encrypted bytes, BIP340 public keys and signatures, hashes,
-generation counters, and timestamps. It never receives plaintext or encryption
-keys.
+generation counters, timestamps, and opaque 32-byte descriptor lookup tokens.
+It has no decryption or key-derivation operations and never interprets a lookup
+token. Clients are responsible for encrypting data before uploading it.
+
+Descriptor lookup is deliberately unauthenticated: knowing a lookup token is
+the read capability for the records it points at. That read capability confers
+no authority to create, change, or remove anything, and one publisher cannot
+alter another publisher's record even when both publish under the same token.
+A lookup result is a set of untrusted candidates; the service cannot prove
+that a token belongs to any particular descriptor, so membership and policy
+validation belong to the client after decryption.
+
+HTTPS protects the transport. It is not a promise that the operator cannot
+correlate records, tokens, or traffic; separate signing identities remove the
+direct public-key join but not timing, address, or ciphertext correlation.
 
 The application rejects malformed input, replay outside the signed window,
 invalid signatures, stale writes, oversized objects, capacity growth beyond
@@ -42,11 +55,20 @@ and connection pooling are not enabled.
 
 ## Storage
 
-Startup verifies the configured SQLite pragmas and exact schema, then
+Startup verifies the configured SQLite pragmas and exact schema, upgrading a
+version 1 database to version 2 by adding descriptor objects only, then
 reconstructs aggregate counters without reading and hashing every ciphertext.
-The `backup` and `verify-backup` commands perform full integrity, row, hash, and
-aggregate verification. Backups may retain ciphertext deleted from the live
-database and must follow an explicit retention policy.
+The `verify-backup` command performs full integrity, row, hash, and
+aggregate verification over both wallet backup heads and descriptor records,
+including that each descriptor has 1–16 lookup associations and every
+association points at an existing record. Descriptor cursor identities and
+sorted associations are included in the aggregate digest. A syntactically
+valid token change needs comparison with a trusted baseline to be detected;
+the server cannot validate its relationship to the encrypted descriptor.
+Association reads stop at 17 rows, enough to reject more than the allowed 16
+without loading an unbounded set from an operator-supplied database copy.
+Backups may retain ciphertext deleted from the live database and must follow
+an explicit retention policy.
 
 ## Logging
 
@@ -57,10 +79,13 @@ rate-limit classes.
 Lifecycle logs are limited to static events, cleanup counts, backup results,
 storage health, and process failures.
 
+A second fixed event per interval carries the descriptor request and storage
+totals under the same rules.
+
 Logs must not contain per-request or per-user ciphertext, public keys,
-signatures, hashes, ETags, source addresses, headers, request bodies, SQL
-values, or database paths. The `aggregate_sha256` printed to an operator's
-standard output by `backup` and `verify-backup` is a database-wide verification
+signatures, hashes, ETags, lookup tokens, digests of lookup tokens, source
+addresses, headers, request bodies, SQL values, or database paths. The `aggregate_sha256` printed to an operator's
+standard output by `verify-backup` is a database-wide verification
 digest, not a request log or per-user identifier, and is exempt for
 before-and-after verification.
 

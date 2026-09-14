@@ -30,8 +30,12 @@ pub struct RateLimiter {
 struct State {
     fetch_by_npub: HashMap<[u8; 32], VecDeque<Instant>>,
     mutation_by_npub: HashMap<[u8; 32], VecDeque<Instant>>,
+    descriptor_store_by_npub: HashMap<[u8; 32], VecDeque<Instant>>,
+    descriptor_lookup_by_tokens: HashMap<[u8; 32], VecDeque<Instant>>,
     fetch_overflow: VecDeque<Instant>,
     mutation_overflow: VecDeque<Instant>,
+    descriptor_store_overflow: VecDeque<Instant>,
+    descriptor_lookup_overflow: VecDeque<Instant>,
     last_full_prune: Option<Instant>,
     #[cfg(test)]
     full_prunes: usize,
@@ -48,8 +52,28 @@ impl State {
         self.last_full_prune = Some(now);
         prune_windows(&mut self.fetch_by_npub, config.fetch_npub.window, now);
         prune_windows(&mut self.mutation_by_npub, config.mutation_npub.window, now);
+        prune_windows(
+            &mut self.descriptor_store_by_npub,
+            config.descriptor_store_npub.window,
+            now,
+        );
+        prune_windows(
+            &mut self.descriptor_lookup_by_tokens,
+            config.descriptor_lookup.window,
+            now,
+        );
         prune_events(&mut self.fetch_overflow, config.overflow.window, now);
         prune_events(&mut self.mutation_overflow, config.overflow.window, now);
+        prune_events(
+            &mut self.descriptor_store_overflow,
+            config.overflow.window,
+            now,
+        );
+        prune_events(
+            &mut self.descriptor_lookup_overflow,
+            config.overflow.window,
+            now,
+        );
         #[cfg(test)]
         {
             self.full_prunes = self.full_prunes.saturating_add(1);
@@ -62,9 +86,15 @@ impl RateLimiter {
         if config.max_subjects == 0
             || config.overflow_retry_after_secs == 0
             || config.prune_interval.is_zero()
-            || [config.overflow, config.fetch_npub, config.mutation_npub]
-                .iter()
-                .any(|limit| limit.requests == 0 || limit.window.is_zero())
+            || [
+                config.overflow,
+                config.fetch_npub,
+                config.mutation_npub,
+                config.descriptor_store_npub,
+                config.descriptor_lookup,
+            ]
+            .iter()
+            .any(|limit| limit.requests == 0 || limit.window.is_zero())
         {
             return Err("limiter values must be positive".to_owned());
         }
@@ -87,6 +117,25 @@ impl RateLimiter {
         self.check(key, Axis::Mutation)
     }
 
+    pub fn check_descriptor_store_npub(&self, npub: &[u8; 32]) -> Result<(), LimitError> {
+        let key = self.digest(b"descriptor-store-npub", npub);
+        self.check(key, Axis::DescriptorStore)
+    }
+
+    /// Descriptor lookups carry no signed identity, so the window is keyed on
+    /// a salted digest of the requested token set. The salt is process
+    /// private and the digest never leaves the limiter.
+    pub fn check_descriptor_lookup(&self, tokens: &[[u8; 32]]) -> Result<(), LimitError> {
+        let mut digest = Sha256::new();
+        digest.update(self.salt);
+        digest.update(b"descriptor-lookup");
+        for token in tokens {
+            digest.update(token);
+        }
+        let key: [u8; 32] = digest.finalize().into();
+        self.check(key, Axis::DescriptorLookup)
+    }
+
     fn check(&self, key: [u8; 32], axis: Axis) -> Result<(), LimitError> {
         let mut state = self.inner.lock().map_err(|_| LimitError::Unavailable)?;
         let now = Instant::now();
@@ -94,8 +143,12 @@ impl RateLimiter {
         let State {
             fetch_by_npub,
             mutation_by_npub,
+            descriptor_store_by_npub,
+            descriptor_lookup_by_tokens,
             fetch_overflow,
             mutation_overflow,
+            descriptor_store_overflow,
+            descriptor_lookup_overflow,
             ..
         } = &mut *state;
         let (map, overflow, limit) = match axis {
@@ -104,6 +157,16 @@ impl RateLimiter {
                 mutation_by_npub,
                 mutation_overflow,
                 self.config.mutation_npub,
+            ),
+            Axis::DescriptorStore => (
+                descriptor_store_by_npub,
+                descriptor_store_overflow,
+                self.config.descriptor_store_npub,
+            ),
+            Axis::DescriptorLookup => (
+                descriptor_lookup_by_tokens,
+                descriptor_lookup_overflow,
+                self.config.descriptor_lookup,
             ),
         };
         check_window(
@@ -131,6 +194,8 @@ impl RateLimiter {
 enum Axis {
     Fetch,
     Mutation,
+    DescriptorStore,
+    DescriptorLookup,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -226,6 +291,8 @@ mod tests {
             prune_interval: Duration::from_secs(60),
             fetch_npub: window(3, 60),
             mutation_npub: window(2, 60),
+            descriptor_store_npub: window(2, 60),
+            descriptor_lookup: window(3, 60),
         }
     }
 
@@ -256,6 +323,50 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn descriptor_axes_are_isolated_from_wallet_backup_windows() -> Result<(), String> {
+        let limiter = RateLimiter::new(config())?;
+        let publisher = [1_u8; 32];
+        let tokens = [[7_u8; 32], [8_u8; 32]];
+        for _ in 0..2 {
+            limiter
+                .check_descriptor_store_npub(&publisher)
+                .map_err(|error| format!("unexpected descriptor store result: {error:?}"))?;
+        }
+        assert!(matches!(
+            limiter.check_descriptor_store_npub(&publisher),
+            Err(LimitError::Exceeded {
+                kind: RateLimitKind::Npub,
+                ..
+            })
+        ));
+        // Exhausting descriptor publication leaves the wallet backup windows
+        // for the same key untouched.
+        limiter
+            .check_mutation_npub(&publisher)
+            .map_err(|error| format!("unexpected mutation result: {error:?}"))?;
+        limiter
+            .check_fetch_npub(&publisher)
+            .map_err(|error| format!("unexpected fetch result: {error:?}"))?;
+
+        for _ in 0..3 {
+            limiter
+                .check_descriptor_lookup(&tokens)
+                .map_err(|error| format!("unexpected descriptor lookup result: {error:?}"))?;
+        }
+        assert!(limiter.check_descriptor_lookup(&tokens).is_err());
+        // A different token set is a different subject.
+        limiter
+            .check_descriptor_lookup(&tokens[..1])
+            .map_err(|error| format!("unexpected second-subject result: {error:?}"))?;
+        // Token order changes the subject key, so the window cannot be probed
+        // for membership by permuting a request.
+        limiter
+            .check_descriptor_lookup(&[tokens[1], tokens[0]])
+            .map_err(|error| format!("unexpected permuted result: {error:?}"))?;
         Ok(())
     }
 

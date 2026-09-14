@@ -1,10 +1,10 @@
 # Wallet backup protocol v1
 
-Protocol v1 is frozen: deployed clients already implement it. The compatibility
-baseline is Bullnym commit `e3c4767d3d7b9c7b278af45299bb78ad8160dc50` and the
-backup portion of Bull Bitcoin Mobile PR 2738 at
-`f49759f00b7c8bbb352ac8ca273db004636ff878`. Wire changes require a new protocol
-version, not an amendment to this one.
+Protocol v1 is the wallet-backup client contract. Reference implementations are
+Bullnym commit `e3c4767d3d7b9c7b278af45299bb78ad8160dc50` and the backup portion
+of Bull Bitcoin Mobile PR 2738 at `f49759f00b7c8bbb352ac8ca273db004636ff878`.
+The v0.4.0 backend release keeps this wire contract unchanged; the package and
+API versions are independent.
 
 ## Constants
 

@@ -1,13 +1,29 @@
 # backup-server
 
-`backup-server` stores one authenticated, opaque encrypted backup head per
-BIP340 public key. It cannot decrypt or interpret stored data.
+`backup-server` stores opaque encrypted data for BIP340 public keys. It cannot
+decrypt or interpret anything it stores.
 
-The public API has three operations:
+It serves two independent resources.
+
+**Wallet backups** are one authenticated head per public key, replaced in
+place:
 
 - `POST /api/v1/wallet-backups/fetch`
 - `PUT /api/v1/wallet-backups`
 - `DELETE /api/v1/wallet-backups`
+
+**Private descriptor records** are immutable publications addressed by their
+ciphertext hash within a publisher namespace, retrieved by opaque lookup
+tokens the client derives and the server never interprets:
+
+- `POST /api/v1/descriptor-backups`
+- `POST /api/v1/descriptor-backups/lookup`
+
+The descriptor resource is additive. It changes no wallet backup request
+format, response, or semantic.
+
+See [CHANGELOG.md](CHANGELOG.md) for the v0.4.0 release scope. The package
+version is independent of the API version; both resources use `/api/v1/`.
 
 ## Build
 
@@ -31,8 +47,14 @@ backup-server serve
 Four variables are required: `BACKUP_SERVER_DB_PATH`,
 `BACKUP_SERVER_MAX_LIVE_BYTES`, `BACKUP_SERVER_MAX_HEADS`, and
 `BACKUP_SERVER_LIMITER_MAX_SUBJECTS`. The optional variables — object size
-ceilings, rate windows, admission budgets, concurrency, timeouts, and log
-level — are enumerated with their development defaults in `src/config.rs`.
+ceilings, rate windows, admission budgets, concurrency, timeouts, descriptor
+record and lookup bounds, and log level — are enumerated with their
+development defaults in `src/config.rs`. Descriptor variables all carry
+`DESCRIPTOR` in their name and every one of them is optional. Size the shared
+queue and growth budget for both resources: the queue must exceed the sum of
+all in-flight limits, and the growth bucket must admit the largest accepted
+metadata or descriptor ciphertext. Defaults do not make every earlier custom
+configuration valid; check the intended configuration before starting service.
 Production limits are set in the deployment environment and are not
 published. The Nginx files under `deploy/` are structural templates whose
 rates are likewise tuned privately before deployment.
@@ -53,6 +75,26 @@ persistent growth bucket. Deletes never refund these budgets. Admission
 checks and mutations commit in one SQLite transaction, so concurrent requests
 cannot overshoot a bucket.
 
+Descriptor records draw from the same persistent growth bucket, but not from
+the head bucket. Exhausting shared growth capacity can temporarily prevent
+metadata creation or growth as well as descriptor publication. Descriptor
+counts are additionally bounded per publisher and across the service.
+
+Each descriptor lookup page consumes one lookup-window request. Size the
+window for multi-page recovery and ordinary retries. Clients must honor
+`Retry-After` and retain a continuation cursor when interrupted; increasing
+limits is not a substitute for resumable recovery. The per-token-set window
+does not replace the proxy's per-source and global limits.
+
+## Upgrade
+
+The database carries a schema version. A version 1 database is upgraded to
+version 2 on startup by adding the two descriptor tables and their index; the
+upgrade never reads or writes `wallet_backup_heads`, and a fresh database is
+built by running the same migration. An aggregate verification digest is
+unchanged by the upgrade alone, so an operator comparing before and after
+sees drift only when descriptor records actually exist.
+
 ## Back up
 
 Copying the database is an operations task, done with standard SQLite tooling
@@ -66,10 +108,16 @@ backup-server verify-backup /srv/backup-server/backup-2026-08-26.sqlite3
 ```
 
 `verify-backup` checks what generic tooling cannot: schema shape, admission
-rows, head and byte consistency, and an aggregate digest for before-and-after
-comparison. Always verify the copy, never the live file in its place, and do
-not replace the previous backup until the new copy verifies. Restoration is an
-offline operation: stop the service, restore the verified file, and restart.
+rows, head and byte consistency, and descriptor lookup associations. Each
+descriptor must have 1–16 valid associations; no association may point at a
+missing record. The aggregate digest includes descriptor contents, cursor
+identities and sorted lookup associations for before-and-after comparison.
+Changing a well-formed token changes that digest, but only comparison with a
+trusted earlier digest can identify the change; the server cannot determine
+which token belongs to an encrypted descriptor. Always verify the copy, never
+the live file in its place, and do not replace the previous backup until the
+new copy verifies. Restoration is an offline operation: stop the service,
+restore the verified file, and restart.
 
 ## Check
 
@@ -83,5 +131,6 @@ cargo doc --no-deps --document-private-items --locked
 cargo audit
 ```
 
-See [docs/protocol-v1.md](docs/protocol-v1.md) for the wire contract and
+See [docs/protocol-v1.md](docs/protocol-v1.md) and
+[docs/descriptor-v1.md](docs/descriptor-v1.md) for the wire contracts, and
 [SECURITY.md](SECURITY.md) for the security boundary.

@@ -23,14 +23,20 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use limits::{LimitError, RateLimiter};
 use protocol::{
-    ApiError, BackupStream, DELETE_ACTION, DeleteRequest, FETCH_ACTION, FetchRequest,
-    FetchResponse, MutationResponse, RateLimitKind, SMALL_BODY_LIMIT_BYTES, STORE_ACTION,
-    StoreRequest, VERSION, compute_etag, decode_canonical_hex, decode_ciphertext, private_no_store,
-    unix_time, validate_generation, validate_version, verify_request_signature,
+    ApiError, BackupStream, DELETE_ACTION, DESCRIPTOR_VERSION, DeleteRequest, DescriptorApiError,
+    DescriptorLookupRequest, DescriptorLookupResponse, DescriptorRecordView, FETCH_ACTION,
+    FetchRequest, FetchResponse, MutationResponse, RateLimitKind, SMALL_BODY_LIMIT_BYTES,
+    STORE_ACTION, StoreDescriptorRequest, StoreDescriptorResponse, StoreRequest, VERSION,
+    canonical_lookup_tokens, compute_etag, decode_canonical_hex, decode_ciphertext,
+    decode_descriptor_ciphertext, decode_descriptor_cursor, decode_descriptor_hex,
+    encode_descriptor_cursor, private_no_store, unix_time, validate_descriptor_version,
+    validate_generation, validate_version, verify_descriptor_signature, verify_request_signature,
 };
 use sha2::{Digest, Sha256};
 use storage::{
-    CallError, MutationOutcome, Storage, StorageConfig, StorageMetricsSnapshot, StorageOwner,
+    CallError, DescriptorLookupBounds, DescriptorLookupCursor, DescriptorMetricsSnapshot,
+    DescriptorStoreOutcome, MutationOutcome, Storage, StorageConfig, StorageMetricsSnapshot,
+    StorageOwner,
 };
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
@@ -46,10 +52,15 @@ struct AppState {
     fetch_in_flight: Arc<Semaphore>,
     store_in_flight: Arc<Semaphore>,
     delete_in_flight: Arc<Semaphore>,
+    descriptor_store_in_flight: Arc<Semaphore>,
+    descriptor_lookup_in_flight: Arc<Semaphore>,
     accepted_ciphertext_bytes: usize,
+    accepted_descriptor_ciphertext_bytes: usize,
+    descriptor_lookup_bounds: DescriptorLookupBounds,
     saturation_retry_after_secs: u64,
     admission_retry_after_secs: u64,
     request_totals: Arc<RequestTotals>,
+    descriptor_totals: Arc<DescriptorTotals>,
 }
 
 struct RequestTotals {
@@ -144,6 +155,95 @@ impl RequestTotals {
     }
 }
 
+const DESCRIPTOR_TOTALS: usize = 15;
+
+struct DescriptorTotals {
+    counts: [AtomicU64; DESCRIPTOR_TOTALS],
+    interval: Duration,
+}
+
+#[derive(Clone, Copy)]
+enum DescriptorOperation {
+    Store,
+    Lookup,
+}
+
+impl DescriptorTotals {
+    fn new(interval: Duration) -> Self {
+        Self {
+            counts: std::array::from_fn(|_| AtomicU64::new(0)),
+            interval,
+        }
+    }
+
+    fn record<T>(&self, operation: DescriptorOperation, result: &Result<T, DescriptorApiError>) {
+        let index = match result {
+            Ok(_) => 0,
+            Err(DescriptorApiError::InvalidRequest(_)) => 1,
+            Err(DescriptorApiError::Authentication) => 2,
+            Err(DescriptorApiError::RecordConflict) => 3,
+            Err(DescriptorApiError::PublisherQuota) => 4,
+            Err(DescriptorApiError::BlobTooLarge) => 5,
+            Err(DescriptorApiError::RateLimited { .. }) => 6,
+            Err(DescriptorApiError::Capacity) => 7,
+            Err(DescriptorApiError::Internal) => 8,
+        };
+        bump(&self.counts[index]);
+        if let Err(DescriptorApiError::RateLimited { kind, .. }) = result {
+            let subtype = match kind {
+                RateLimitKind::Npub => 9,
+                RateLimitKind::Overflow => 10,
+                RateLimitKind::Saturation => 11,
+                RateLimitKind::Admission => 12,
+            };
+            bump(&self.counts[subtype]);
+        }
+        let operation_index = match operation {
+            DescriptorOperation::Store => 13,
+            DescriptorOperation::Lookup => 14,
+        };
+        bump(&self.counts[operation_index]);
+    }
+
+    fn take(&self) -> [u64; DESCRIPTOR_TOTALS] {
+        std::array::from_fn(|index| self.counts[index].swap(0, Ordering::Relaxed))
+    }
+
+    fn emit(&self, storage: DescriptorMetricsSnapshot) {
+        let counts = self.take();
+        tracing::info!(
+            event = "descriptor_backup_request_totals",
+            interval_seconds = self.interval.as_secs(),
+            success = counts[0],
+            descriptor_invalid_request = counts[1],
+            descriptor_auth_error = counts[2],
+            descriptor_record_conflict = counts[3],
+            descriptor_publisher_quota = counts[4],
+            descriptor_blob_too_large = counts[5],
+            rate_limited = counts[6],
+            descriptor_capacity_exceeded = counts[7],
+            internal_error = counts[8],
+            rate_limited_npub = counts[9],
+            rate_limited_overflow = counts[10],
+            rate_limited_saturation = counts[11],
+            rate_limited_admission = counts[12],
+            store_requests = counts[13],
+            lookup_requests = counts[14],
+            records_admitted = storage.records_admitted,
+            record_bytes_admitted = storage.record_bytes_admitted,
+            current_records = storage.current_records,
+            current_bytes = storage.current_bytes,
+            "descriptor backup request totals"
+        );
+    }
+}
+
+fn bump(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_add(1))
+    });
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     if let Err(error) = init_logging() {
@@ -180,8 +280,12 @@ async fn run() -> Result<(), String> {
             }
             let report = storage::verify_backup(&path)?;
             println!(
-                "verified backup: heads={} live_bytes={} aggregate_sha256={}",
-                report.heads, report.live_bytes, report.aggregate_sha256
+                "verified backup: heads={} live_bytes={} descriptor_records={} descriptor_bytes={} aggregate_sha256={}",
+                report.heads,
+                report.live_bytes,
+                report.descriptor_records,
+                report.descriptor_bytes,
+                report.aggregate_sha256
             );
             Ok(())
         }
@@ -216,6 +320,7 @@ fn init_logging() -> Result<(), String> {
 async fn serve(config: config::Config) -> Result<(), String> {
     let limiter = RateLimiter::new(config.limiter)?;
     let request_totals = Arc::new(RequestTotals::new(config.request_totals_interval));
+    let descriptor_totals = Arc::new(DescriptorTotals::new(config.request_totals_interval));
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .map_err(|_| "failed to bind loopback listener".to_owned())?;
@@ -225,6 +330,8 @@ async fn serve(config: config::Config) -> Result<(), String> {
         busy_timeout: config.busy_timeout,
         max_live_bytes: config.max_live_bytes,
         max_heads: config.max_heads,
+        max_descriptor_records: config.max_descriptor_records,
+        max_descriptor_records_per_publisher: config.max_descriptor_records_per_publisher,
         admission: config.admission,
     })?;
     let storage = owner.client();
@@ -234,12 +341,26 @@ async fn serve(config: config::Config) -> Result<(), String> {
         fetch_in_flight: Arc::new(Semaphore::new(config.fetch_max_in_flight)),
         store_in_flight: Arc::new(Semaphore::new(config.store_max_in_flight)),
         delete_in_flight: Arc::new(Semaphore::new(config.delete_max_in_flight)),
+        descriptor_store_in_flight: Arc::new(Semaphore::new(config.descriptor_store_max_in_flight)),
+        descriptor_lookup_in_flight: Arc::new(Semaphore::new(
+            config.descriptor_lookup_max_in_flight,
+        )),
         accepted_ciphertext_bytes: config.accepted_ciphertext_bytes,
+        accepted_descriptor_ciphertext_bytes: config.accepted_descriptor_ciphertext_bytes,
+        descriptor_lookup_bounds: DescriptorLookupBounds {
+            record_cap: config.descriptor_lookup_record_cap,
+            byte_budget: config.descriptor_lookup_max_bytes,
+        },
         saturation_retry_after_secs: config.saturation_retry_after_secs,
         admission_retry_after_secs: config.admission_retry_after_secs,
         request_totals: Arc::clone(&request_totals),
+        descriptor_totals: Arc::clone(&descriptor_totals),
     };
-    let router = router(state, config.store_body_limit_bytes);
+    let router = router(
+        state,
+        config.store_body_limit_bytes,
+        config.descriptor_store_body_limit_bytes,
+    );
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
     let cleanup = tokio::spawn(cleanup_loop(
         storage.clone(),
@@ -250,6 +371,7 @@ async fn serve(config: config::Config) -> Result<(), String> {
     ));
     let totals = tokio::spawn(request_totals_loop(
         request_totals,
+        descriptor_totals,
         storage,
         shutdown_receiver.clone(),
     ));
@@ -305,7 +427,11 @@ async fn stop_task(
     }
 }
 
-fn router(state: AppState, store_body_limit_bytes: usize) -> Router {
+fn router(
+    state: AppState,
+    store_body_limit_bytes: usize,
+    descriptor_store_body_limit_bytes: usize,
+) -> Router {
     Router::new()
         .route(
             "/api/v1/wallet-backups/fetch",
@@ -318,6 +444,14 @@ fn router(state: AppState, store_body_limit_bytes: usize) -> Router {
         .route(
             "/api/v1/wallet-backups",
             delete(delete_backup).layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/api/v1/descriptor-backups",
+            post(store_descriptor).layer(DefaultBodyLimit::max(descriptor_store_body_limit_bytes)),
+        )
+        .route(
+            "/api/v1/descriptor-backups/lookup",
+            post(lookup_descriptors).layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT_BYTES)),
         )
         .route("/healthz", get(health))
         .with_state(state)
@@ -398,6 +532,7 @@ async fn cleanup_loop(
 
 async fn request_totals_loop(
     totals: Arc<RequestTotals>,
+    descriptor_totals: Arc<DescriptorTotals>,
     storage: Storage,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -413,6 +548,7 @@ async fn request_totals_loop(
             }
             _ = ticker.tick() => {
                 totals.emit(storage.metrics_snapshot());
+                descriptor_totals.emit(storage.descriptor_metrics_snapshot());
             }
         }
     }
@@ -777,6 +913,246 @@ async fn delete_inner(
     ))
 }
 
+async fn descriptor_json_request<T>(
+    request: Request,
+    state: &AppState,
+) -> Result<T, DescriptorApiError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    match Json::<T>::from_request(request, state).await {
+        Ok(Json(value)) => Ok(value),
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            Err(DescriptorApiError::BlobTooLarge)
+        }
+        Err(_) => Err(DescriptorApiError::InvalidRequest(
+            "Descriptor backup request body is invalid.",
+        )),
+    }
+}
+
+fn descriptor_source_identity(headers: &HeaderMap) -> Result<IpAddr, DescriptorApiError> {
+    source_identity(headers).map_err(|_| {
+        DescriptorApiError::InvalidRequest("Descriptor backup source identity is invalid.")
+    })
+}
+
+fn map_descriptor_limit(error: LimitError) -> DescriptorApiError {
+    match error {
+        LimitError::Exceeded {
+            retry_after_secs,
+            kind,
+        } => DescriptorApiError::RateLimited {
+            retry_after_secs,
+            kind,
+        },
+        LimitError::Unavailable => DescriptorApiError::Internal,
+    }
+}
+
+fn map_descriptor_storage(
+    error: CallError,
+    saturation_retry_after_secs: u64,
+) -> DescriptorApiError {
+    match error {
+        CallError::QueueFull => DescriptorApiError::RateLimited {
+            retry_after_secs: saturation_retry_after_secs,
+            kind: RateLimitKind::Saturation,
+        },
+        CallError::Unavailable | CallError::Storage => DescriptorApiError::Internal,
+    }
+}
+
+fn descriptor_now_i64() -> Result<i64, DescriptorApiError> {
+    unix_time()
+        .map_err(|_| DescriptorApiError::Internal)
+        .and_then(|now| i64::try_from(now).map_err(|_| DescriptorApiError::Internal))
+}
+
+async fn store_descriptor(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Request,
+) -> Result<Response, DescriptorApiError> {
+    let result = store_descriptor_inner(&state, &headers, request).await;
+    state
+        .descriptor_totals
+        .record(DescriptorOperation::Store, &result);
+    result
+}
+
+async fn store_descriptor_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: Request,
+) -> Result<Response, DescriptorApiError> {
+    let permit = Arc::clone(&state.descriptor_store_in_flight)
+        .try_acquire_owned()
+        .map_err(|_| DescriptorApiError::RateLimited {
+            retry_after_secs: state.saturation_retry_after_secs,
+            kind: RateLimitKind::Saturation,
+        })?;
+    descriptor_source_identity(headers)?;
+    let request: StoreDescriptorRequest = descriptor_json_request(request, state).await?;
+    validate_descriptor_version(request.version)?;
+    let publisher = decode_descriptor_hex::<32>(
+        &request.npub,
+        "Descriptor backup public key must be 64 lowercase hexadecimal characters.",
+    )?;
+    let declared_hash = decode_descriptor_hex::<32>(
+        &request.ciphertext_sha256,
+        "Descriptor backup ciphertext hash is invalid.",
+    )?;
+    let tokens = canonical_lookup_tokens(&request.lookup_tokens)?;
+    verify_descriptor_signature(
+        &request.npub,
+        &request.ciphertext_sha256,
+        request.ciphertext_bytes,
+        &request.lookup_tokens,
+        request.timestamp,
+        &request.signature,
+        unix_time().map_err(|_| DescriptorApiError::Internal)?,
+    )?;
+    if request.ciphertext_bytes
+        > u64::try_from(state.accepted_descriptor_ciphertext_bytes)
+            .map_err(|_| DescriptorApiError::Internal)?
+    {
+        return Err(DescriptorApiError::BlobTooLarge);
+    }
+    state
+        .limiter
+        .check_descriptor_store_npub(&publisher)
+        .map_err(map_descriptor_limit)?;
+    let ciphertext = decode_descriptor_ciphertext(
+        &request.ciphertext,
+        state.accepted_descriptor_ciphertext_bytes,
+    )?;
+    let actual_bytes = u64::try_from(ciphertext.len()).map_err(|_| DescriptorApiError::Internal)?;
+    if request.ciphertext_bytes != actual_bytes {
+        return Err(DescriptorApiError::InvalidRequest(
+            "Descriptor backup ciphertext byte count does not match.",
+        ));
+    }
+    if actual_bytes == 0 {
+        return Err(DescriptorApiError::InvalidRequest(
+            "Descriptor backup ciphertext must not be empty.",
+        ));
+    }
+    let actual_hash: [u8; 32] = Sha256::digest(&ciphertext).into();
+    if actual_hash != declared_hash {
+        return Err(DescriptorApiError::InvalidRequest(
+            "Descriptor backup ciphertext hash does not match.",
+        ));
+    }
+    let outcome = state
+        .storage
+        .store_descriptor(
+            publisher,
+            declared_hash,
+            ciphertext,
+            tokens,
+            descriptor_now_i64()?,
+        )
+        .await
+        .map_err(|error| map_descriptor_storage(error, state.saturation_retry_after_secs))?;
+    let created_at = match outcome {
+        DescriptorStoreOutcome::Created { created_at }
+        | DescriptorStoreOutcome::ExactRetry { created_at } => created_at,
+        DescriptorStoreOutcome::Conflict => return Err(DescriptorApiError::RecordConflict),
+        DescriptorStoreOutcome::PublisherQuotaExceeded => {
+            return Err(DescriptorApiError::PublisherQuota);
+        }
+        DescriptorStoreOutcome::CapacityExceeded => return Err(DescriptorApiError::Capacity),
+        DescriptorStoreOutcome::AdmissionLimited => {
+            return Err(DescriptorApiError::RateLimited {
+                retry_after_secs: state.admission_retry_after_secs,
+                kind: RateLimitKind::Admission,
+            });
+        }
+    };
+    drop(permit);
+    Ok(private_no_store(
+        Json(StoreDescriptorResponse {
+            version: DESCRIPTOR_VERSION,
+            ciphertext_sha256: request.ciphertext_sha256,
+            created_at,
+        })
+        .into_response(),
+    ))
+}
+
+async fn lookup_descriptors(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Request,
+) -> Result<Response, DescriptorApiError> {
+    let result = lookup_descriptors_inner(&state, &headers, request).await;
+    state
+        .descriptor_totals
+        .record(DescriptorOperation::Lookup, &result);
+    result
+}
+
+/// Knowing a lookup token is the read capability, so this route is
+/// deliberately unauthenticated. It never returns a publisher identity or a
+/// token, and a reader gains no authority to change anything.
+async fn lookup_descriptors_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: Request,
+) -> Result<Response, DescriptorApiError> {
+    let permit = Arc::clone(&state.descriptor_lookup_in_flight)
+        .try_acquire_owned()
+        .map_err(|_| DescriptorApiError::RateLimited {
+            retry_after_secs: state.saturation_retry_after_secs,
+            kind: RateLimitKind::Saturation,
+        })?;
+    descriptor_source_identity(headers)?;
+    let request: DescriptorLookupRequest = descriptor_json_request(request, state).await?;
+    validate_descriptor_version(request.version)?;
+    let tokens = canonical_lookup_tokens(&request.lookup_tokens)?;
+    let cursor = match request.cursor.as_deref() {
+        Some(value) => {
+            let (created_at, record_id) = decode_descriptor_cursor(value)?;
+            Some(DescriptorLookupCursor {
+                created_at,
+                record_id,
+            })
+        }
+        None => None,
+    };
+    state
+        .limiter
+        .check_descriptor_lookup(&tokens)
+        .map_err(map_descriptor_limit)?;
+    let outcome = state
+        .storage
+        .lookup_descriptors(tokens, state.descriptor_lookup_bounds, cursor)
+        .await
+        .map_err(|error| map_descriptor_storage(error, state.saturation_retry_after_secs))?;
+    let mut records = Vec::with_capacity(outcome.records.len());
+    for record in outcome.records {
+        records.push(DescriptorRecordView {
+            ciphertext_bytes: u64::try_from(record.ciphertext.len())
+                .map_err(|_| DescriptorApiError::Internal)?,
+            ciphertext: BASE64_STANDARD.encode(record.ciphertext),
+            ciphertext_sha256: hex::encode(record.ciphertext_sha256),
+            created_at: record.created_at,
+        });
+    }
+    drop(permit);
+    Ok(private_no_store(
+        Json(DescriptorLookupResponse {
+            version: DESCRIPTOR_VERSION,
+            next_cursor: outcome
+                .next
+                .map(|cursor| encode_descriptor_cursor(cursor.created_at, cursor.record_id)),
+            records,
+        })
+        .into_response(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -784,7 +1160,9 @@ mod tests {
     use axum::http::HeaderValue;
     use config::{AdmissionBucketConfig, AdmissionConfig, LimiterConfig, WindowLimit};
     use protocol::{
-        ABSOLUTE_MAX_CIPHERTEXT_BYTES, ABSOLUTE_MAX_STORE_BODY_BYTES, build_signing_message,
+        ABSOLUTE_MAX_CIPHERTEXT_BYTES, ABSOLUTE_MAX_DESCRIPTOR_CIPHERTEXT_BYTES,
+        ABSOLUTE_MAX_DESCRIPTOR_STORE_BODY_BYTES, ABSOLUTE_MAX_STORE_BODY_BYTES,
+        DESCRIPTOR_STORE_ACTION, build_descriptor_signing_message, build_signing_message,
     };
     use secp256k1::{Keypair, Secp256k1, SecretKey};
     use std::fs;
@@ -852,11 +1230,17 @@ mod tests {
             prune_interval: Duration::from_secs(60),
             fetch_npub: limit,
             mutation_npub: limit,
+            descriptor_store_npub: limit,
+            descriptor_lookup: limit,
         }
     }
 
     fn test_router(state: AppState) -> Router {
-        router(state, ABSOLUTE_MAX_STORE_BODY_BYTES)
+        router(
+            state,
+            ABSOLUTE_MAX_STORE_BODY_BYTES,
+            ABSOLUTE_MAX_DESCRIPTOR_STORE_BODY_BYTES,
+        )
     }
 
     fn test_state(name: &str) -> Result<(PathBuf, StorageOwner, AppState), String> {
@@ -871,6 +1255,8 @@ mod tests {
             busy_timeout: Duration::from_secs(1),
             max_live_bytes: 1024,
             max_heads: 4,
+            max_descriptor_records: 16,
+            max_descriptor_records_per_publisher: 4,
             admission: test_admission(),
         })?;
         let state = AppState {
@@ -879,10 +1265,18 @@ mod tests {
             fetch_in_flight: Arc::new(Semaphore::new(4)),
             store_in_flight: Arc::new(Semaphore::new(4)),
             delete_in_flight: Arc::new(Semaphore::new(4)),
+            descriptor_store_in_flight: Arc::new(Semaphore::new(4)),
+            descriptor_lookup_in_flight: Arc::new(Semaphore::new(4)),
             accepted_ciphertext_bytes: ABSOLUTE_MAX_CIPHERTEXT_BYTES,
+            accepted_descriptor_ciphertext_bytes: ABSOLUTE_MAX_DESCRIPTOR_CIPHERTEXT_BYTES,
+            descriptor_lookup_bounds: DescriptorLookupBounds {
+                record_cap: 32,
+                byte_budget: 512 * 1024,
+            },
             saturation_retry_after_secs: 5,
             admission_retry_after_secs: 900,
             request_totals: Arc::new(RequestTotals::new(Duration::from_secs(60))),
+            descriptor_totals: Arc::new(DescriptorTotals::new(Duration::from_secs(60))),
         };
         Ok((directory, owner, state))
     }
@@ -1903,6 +2297,818 @@ mod tests {
 
         owner.shutdown().await?;
         fs::remove_dir_all(directory).map_err(|_| "failed to clean test directory".to_owned())?;
+        Ok(())
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DescriptorTamperFixture {
+        ciphertext: String,
+        ciphertext_bytes: u64,
+        ciphertext_sha256: String,
+        lookup_tokens: Vec<String>,
+        tamper_cases: Vec<TamperCase>,
+        vectors: Vec<DescriptorFixtureVector>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DescriptorFixtureVector {
+        npub: String,
+        test_only_secret_key: String,
+    }
+
+    const DESCRIPTOR_STORE_PATH: &str = "/api/v1/descriptor-backups";
+    const DESCRIPTOR_LOOKUP_PATH: &str = "/api/v1/descriptor-backups/lookup";
+
+    fn descriptor_fixture() -> Result<DescriptorTamperFixture, String> {
+        serde_json::from_str(include_str!("../tests/fixtures/descriptor-backup-v1.json"))
+            .map_err(|_| "invalid descriptor fixture".to_owned())
+    }
+
+    fn fixture_keypair(secret_hex: &str) -> Result<Keypair, String> {
+        let bytes: [u8; 32] = hex::decode(secret_hex)
+            .map_err(|_| "invalid fixture secret".to_owned())?
+            .try_into()
+            .map_err(|_| "invalid fixture secret".to_owned())?;
+        let secret =
+            SecretKey::from_byte_array(bytes).map_err(|_| "invalid fixture secret".to_owned())?;
+        Ok(Keypair::from_secret_key(&Secp256k1::new(), &secret))
+    }
+
+    fn descriptor_token(byte: u8) -> String {
+        hex::encode([byte; 32])
+    }
+
+    fn signed_descriptor_body(
+        keypair: &Keypair,
+        ciphertext: &[u8],
+        tokens: &[String],
+        timestamp: u64,
+    ) -> Result<serde_json::Value, String> {
+        let npub = keypair.x_only_public_key().0.to_string();
+        let hash = hex::encode(Sha256::digest(ciphertext));
+        let bytes =
+            u64::try_from(ciphertext.len()).map_err(|_| "test ciphertext overflow".to_owned())?;
+        let message = build_descriptor_signing_message(
+            DESCRIPTOR_STORE_ACTION,
+            &npub,
+            &hash,
+            bytes,
+            tokens,
+            timestamp,
+        );
+        let digest: [u8; 32] = Sha256::digest(message).into();
+        let signature = Secp256k1::new()
+            .sign_schnorr_no_aux_rand(&digest, keypair)
+            .to_string();
+        Ok(serde_json::json!({
+            "version": 1,
+            "npub": npub,
+            "ciphertext": BASE64_STANDARD.encode(ciphertext),
+            "ciphertext_sha256": hash,
+            "ciphertext_bytes": bytes,
+            "lookup_tokens": tokens,
+            "timestamp": timestamp,
+            "signature": signature,
+        }))
+    }
+
+    async fn send_descriptor(
+        state: AppState,
+        path: &'static str,
+        body: &serde_json::Value,
+    ) -> Result<(StatusCode, serde_json::Value), String> {
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("x-real-ip", "192.0.2.11")
+            .body(Body::from(body.to_string()))
+            .map_err(|_| "failed to build descriptor request".to_owned())?;
+        let response = test_router(state)
+            .oneshot(request)
+            .await
+            .map_err(|_| "descriptor router failed".to_owned())?;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .map_err(|_| "failed to read descriptor response".to_owned())?;
+        let value = serde_json::from_slice(&bytes)
+            .map_err(|_| "invalid descriptor response JSON".to_owned())?;
+        Ok((status, value))
+    }
+
+    fn response_code(value: &serde_json::Value) -> Result<&str, String> {
+        value
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "descriptor response code is missing".to_owned())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn signed_descriptor_store_and_lookup_match_http_contract() -> Result<(), String> {
+        let (directory, owner, state) = test_state("descriptor-http")?;
+        let fixture = descriptor_fixture()?;
+        let publisher = fixture
+            .vectors
+            .first()
+            .ok_or_else(|| "fixture vector is missing".to_owned())?;
+        let keypair = fixture_keypair(&publisher.test_only_secret_key)?;
+        let timestamp = unix_time().map_err(|_| "clock unavailable".to_owned())?;
+        let ciphertext = (0_u8..32).collect::<Vec<_>>();
+        let body =
+            signed_descriptor_body(&keypair, &ciphertext, &fixture.lookup_tokens, timestamp)?;
+
+        let (status, stored) = send_descriptor(state.clone(), DESCRIPTOR_STORE_PATH, &body).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            stored
+                .get("ciphertext_sha256")
+                .and_then(serde_json::Value::as_str),
+            Some(fixture.ciphertext_sha256.as_str())
+        );
+        let created_at = stored
+            .get("created_at")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| "created_at is missing".to_owned())?;
+
+        // Idempotent retry: same answer, same creation time.
+        let (retry_status, retried) =
+            send_descriptor(state.clone(), DESCRIPTOR_STORE_PATH, &body).await?;
+        assert_eq!(retry_status, StatusCode::OK);
+        assert_eq!(
+            retried
+                .get("created_at")
+                .and_then(serde_json::Value::as_i64),
+            Some(created_at)
+        );
+
+        for token in &fixture.lookup_tokens {
+            let lookup = serde_json::json!({"version": 1, "lookup_tokens": [token]});
+            let (lookup_status, found) =
+                send_descriptor(state.clone(), DESCRIPTOR_LOOKUP_PATH, &lookup).await?;
+            assert_eq!(lookup_status, StatusCode::OK);
+            assert!(
+                found
+                    .get("next_cursor")
+                    .is_some_and(serde_json::Value::is_null)
+            );
+            let records = found
+                .get("records")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| "records are missing".to_owned())?;
+            assert_eq!(records.len(), 1);
+            let record = records
+                .first()
+                .ok_or_else(|| "record is missing".to_owned())?;
+            assert_eq!(
+                record.get("ciphertext").and_then(serde_json::Value::as_str),
+                Some(fixture.ciphertext.as_str())
+            );
+            assert_eq!(
+                record
+                    .get("ciphertext_bytes")
+                    .and_then(serde_json::Value::as_u64),
+                Some(fixture.ciphertext_bytes)
+            );
+            // A reader never learns who published, or which other tokens exist.
+            let serialized = found.to_string();
+            assert!(!serialized.contains(&publisher.npub));
+            for other in &fixture.lookup_tokens {
+                assert!(!serialized.contains(other.as_str()));
+            }
+        }
+
+        let unknown = serde_json::json!({
+            "version": 1,
+            "lookup_tokens": [descriptor_token(0xfe)]
+        });
+        let (unknown_status, empty) =
+            send_descriptor(state.clone(), DESCRIPTOR_LOOKUP_PATH, &unknown).await?;
+        assert_eq!(unknown_status, StatusCode::OK);
+        assert_eq!(
+            empty
+                .get("records")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+
+        // A different token set under the same record identity is refused.
+        let mut conflicting = fixture.lookup_tokens.clone();
+        conflicting.pop();
+        let conflict_body = signed_descriptor_body(&keypair, &ciphertext, &conflicting, timestamp)?;
+        let (conflict_status, conflict) =
+            send_descriptor(state.clone(), DESCRIPTOR_STORE_PATH, &conflict_body).await?;
+        assert_eq!(conflict_status, StatusCode::CONFLICT);
+        assert_eq!(response_code(&conflict)?, "DescriptorRecordConflict");
+
+        // A second publisher publishes under the same tokens without changing
+        // the first publisher's record.
+        let second = fixture
+            .vectors
+            .get(1)
+            .ok_or_else(|| "second fixture vector is missing".to_owned())?;
+        let other = fixture_keypair(&second.test_only_secret_key)?;
+        let other_ciphertext = vec![0xab_u8; 48];
+        let other_body =
+            signed_descriptor_body(&other, &other_ciphertext, &fixture.lookup_tokens, timestamp)?;
+        let (other_status, _) =
+            send_descriptor(state.clone(), DESCRIPTOR_STORE_PATH, &other_body).await?;
+        assert_eq!(other_status, StatusCode::OK);
+        let first_token = fixture
+            .lookup_tokens
+            .first()
+            .ok_or_else(|| "fixture token is missing".to_owned())?;
+        let lookup = serde_json::json!({"version": 1, "lookup_tokens": [first_token]});
+        let (_, both) = send_descriptor(state.clone(), DESCRIPTOR_LOOKUP_PATH, &lookup).await?;
+        let records = both
+            .get("records")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "records are missing".to_owned())?;
+        assert_eq!(records.len(), 2);
+        let original_still_present = records.iter().any(|record| {
+            record.get("ciphertext").and_then(serde_json::Value::as_str)
+                == Some(fixture.ciphertext.as_str())
+        });
+        assert!(original_still_present);
+
+        owner.shutdown().await?;
+        fs::remove_dir_all(directory).map_err(|_| "failed to clean test directory".to_owned())?;
+        Ok(())
+    }
+
+    /// Two publishers under one token with a one-record page: the older record
+    /// is reachable only by following the cursor, and the cursor is opaque.
+    #[tokio::test]
+    async fn descriptor_lookup_pages_through_history_by_cursor() -> Result<(), String> {
+        let (directory, owner, mut state) = test_state("descriptor-paging")?;
+        state.descriptor_lookup_bounds = DescriptorLookupBounds {
+            record_cap: 1,
+            byte_budget: 1 << 20,
+        };
+        let fixture = descriptor_fixture()?;
+        let timestamp = unix_time().map_err(|_| "clock unavailable".to_owned())?;
+        for (index, vector) in fixture.vectors.iter().take(2).enumerate() {
+            let keypair = fixture_keypair(&vector.test_only_secret_key)?;
+            let ciphertext = vec![u8::try_from(index).unwrap_or(0); 32 + index];
+            let body =
+                signed_descriptor_body(&keypair, &ciphertext, &fixture.lookup_tokens, timestamp)?;
+            let (status, _) = send_descriptor(state.clone(), DESCRIPTOR_STORE_PATH, &body).await?;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let token = fixture
+            .lookup_tokens
+            .first()
+            .ok_or_else(|| "fixture token is missing".to_owned())?;
+
+        let lookup = serde_json::json!({"version": 1, "lookup_tokens": [token]});
+        let (status, first) =
+            send_descriptor(state.clone(), DESCRIPTOR_LOOKUP_PATH, &lookup).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            first
+                .get("records")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        let cursor = first
+            .get("next_cursor")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "a truncated page must carry a cursor".to_owned())?
+            .to_owned();
+        // The cursor names a position, never a publisher or a token.
+        for vector in &fixture.vectors {
+            assert!(!cursor.contains(&vector.npub));
+        }
+        for other in &fixture.lookup_tokens {
+            assert!(!cursor.contains(other.as_str()));
+        }
+
+        let next = serde_json::json!({"version": 1, "lookup_tokens": [token], "cursor": cursor});
+        let (next_status, second) =
+            send_descriptor(state.clone(), DESCRIPTOR_LOOKUP_PATH, &next).await?;
+        assert_eq!(next_status, StatusCode::OK);
+        assert_eq!(
+            second
+                .get("records")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert!(
+            second
+                .get("next_cursor")
+                .is_some_and(serde_json::Value::is_null)
+        );
+        assert_ne!(first.get("records"), second.get("records"));
+
+        // A malformed cursor is a bad request, never a silent restart from
+        // the newest page.
+        let forged =
+            serde_json::json!({"version": 1, "lookup_tokens": [token], "cursor": "not-base64!"});
+        let (forged_status, forged_body) =
+            send_descriptor(state.clone(), DESCRIPTOR_LOOKUP_PATH, &forged).await?;
+        assert_eq!(forged_status, StatusCode::BAD_REQUEST);
+        assert_eq!(response_code(&forged_body)?, "DescriptorInvalidRequest");
+
+        // Unknown fields are still refused, cursor or no cursor.
+        let unknown = serde_json::json!({"version": 1, "lookup_tokens": [token], "page": cursor});
+        let (unknown_status, _) =
+            send_descriptor(state.clone(), DESCRIPTOR_LOOKUP_PATH, &unknown).await?;
+        assert_eq!(unknown_status, StatusCode::BAD_REQUEST);
+
+        // Possessing a cursor does not grant the original token's read access.
+        let unrelated = serde_json::json!({
+            "version": 1, "lookup_tokens": [descriptor_token(0xfe)], "cursor": cursor
+        });
+        let (unrelated_status, unrelated_body) =
+            send_descriptor(state.clone(), DESCRIPTOR_LOOKUP_PATH, &unrelated).await?;
+        assert_eq!(unrelated_status, StatusCode::OK);
+        assert_eq!(unrelated_body.get("records"), Some(&serde_json::json!([])));
+        assert_eq!(
+            unrelated_body.get("next_cursor"),
+            Some(&serde_json::Value::Null)
+        );
+
+        owner.shutdown().await?;
+        fs::remove_dir_all(directory).map_err(|_| "failed to clean test directory".to_owned())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn descriptor_tamper_matrix_matches_http_errors() -> Result<(), String> {
+        let (directory, owner, state) = test_state("descriptor-tamper")?;
+        let fixture = descriptor_fixture()?;
+        let publisher = fixture
+            .vectors
+            .first()
+            .ok_or_else(|| "fixture vector is missing".to_owned())?;
+        let keypair = fixture_keypair(&publisher.test_only_secret_key)?;
+        assert_eq!(keypair.x_only_public_key().0.to_string(), publisher.npub);
+        let timestamp = unix_time().map_err(|_| "clock unavailable".to_owned())?;
+        let ciphertext = (0_u8..32).collect::<Vec<_>>();
+        let baseline =
+            signed_descriptor_body(&keypair, &ciphertext, &fixture.lookup_tokens, timestamp)?;
+
+        for tamper in &fixture.tamper_cases {
+            let expected_status = match tamper.expected_code.as_str() {
+                "DescriptorInvalidRequest" => StatusCode::BAD_REQUEST,
+                "DescriptorAuthError" => StatusCode::UNAUTHORIZED,
+                _ => return Err("fixture contains an unknown error code".to_owned()),
+            };
+            let mut body = baseline.clone();
+            match tamper.field.as_str() {
+                "version" => {
+                    replace_json_field(&mut body, "version", serde_json::Value::from(2))?;
+                }
+                "npub" => {
+                    let other = fixture
+                        .vectors
+                        .get(1)
+                        .ok_or_else(|| "second fixture vector is missing".to_owned())?;
+                    replace_json_field(
+                        &mut body,
+                        "npub",
+                        serde_json::Value::String(other.npub.clone()),
+                    )?;
+                }
+                "ciphertext_sha256" => {
+                    let tampered = "33".repeat(32);
+                    let re_signed = signed_descriptor_body(
+                        &keypair,
+                        &ciphertext,
+                        &fixture.lookup_tokens,
+                        timestamp,
+                    )?;
+                    let message = build_descriptor_signing_message(
+                        DESCRIPTOR_STORE_ACTION,
+                        &publisher.npub,
+                        &tampered,
+                        fixture.ciphertext_bytes,
+                        &fixture.lookup_tokens,
+                        timestamp,
+                    );
+                    let digest: [u8; 32] = Sha256::digest(message).into();
+                    body = re_signed;
+                    replace_json_field(
+                        &mut body,
+                        "ciphertext_sha256",
+                        serde_json::Value::String(tampered),
+                    )?;
+                    replace_json_field(
+                        &mut body,
+                        "signature",
+                        serde_json::Value::String(
+                            Secp256k1::new()
+                                .sign_schnorr_no_aux_rand(&digest, &keypair)
+                                .to_string(),
+                        ),
+                    )?;
+                }
+                "ciphertext_bytes" => {
+                    let message = build_descriptor_signing_message(
+                        DESCRIPTOR_STORE_ACTION,
+                        &publisher.npub,
+                        &fixture.ciphertext_sha256,
+                        fixture.ciphertext_bytes + 1,
+                        &fixture.lookup_tokens,
+                        timestamp,
+                    );
+                    let digest: [u8; 32] = Sha256::digest(message).into();
+                    replace_json_field(
+                        &mut body,
+                        "ciphertext_bytes",
+                        serde_json::Value::from(fixture.ciphertext_bytes + 1),
+                    )?;
+                    replace_json_field(
+                        &mut body,
+                        "signature",
+                        serde_json::Value::String(
+                            Secp256k1::new()
+                                .sign_schnorr_no_aux_rand(&digest, &keypair)
+                                .to_string(),
+                        ),
+                    )?;
+                }
+                "lookup_tokens_order" => {
+                    let mut reversed = fixture.lookup_tokens.clone();
+                    reversed.reverse();
+                    replace_json_field(
+                        &mut body,
+                        "lookup_tokens",
+                        serde_json::Value::from(reversed),
+                    )?;
+                }
+                "lookup_tokens_member" => {
+                    let mut swapped = fixture.lookup_tokens.clone();
+                    let last = swapped
+                        .last_mut()
+                        .ok_or_else(|| "fixture token is missing".to_owned())?;
+                    *last = descriptor_token(0xff);
+                    replace_json_field(
+                        &mut body,
+                        "lookup_tokens",
+                        serde_json::Value::from(swapped),
+                    )?;
+                }
+                "timestamp" => {
+                    replace_json_field(
+                        &mut body,
+                        "timestamp",
+                        serde_json::Value::from(
+                            timestamp
+                                .checked_add(1)
+                                .ok_or_else(|| "test timestamp overflow".to_owned())?,
+                        ),
+                    )?;
+                }
+                "signature" => {
+                    replace_json_field(
+                        &mut body,
+                        "signature",
+                        serde_json::Value::String("00".repeat(64)),
+                    )?;
+                }
+                _ => return Err("fixture contains an unknown tamper field".to_owned()),
+            }
+            let (status, value) =
+                send_descriptor(state.clone(), DESCRIPTOR_STORE_PATH, &body).await?;
+            assert_eq!(status, expected_status, "{}", tamper.field);
+            assert_eq!(
+                response_code(&value)?,
+                tamper.expected_code,
+                "{}",
+                tamper.field
+            );
+        }
+
+        // Malformed hex and out-of-range token counts are refused before any
+        // signature work.
+        for tokens in [
+            serde_json::json!([]),
+            serde_json::json!(["not-hex"]),
+            serde_json::json!([descriptor_token(1), descriptor_token(1)]),
+            serde_json::Value::from((0_u8..=16).map(descriptor_token).collect::<Vec<_>>()),
+        ] {
+            let mut body = baseline.clone();
+            replace_json_field(&mut body, "lookup_tokens", tokens)?;
+            let (status, value) =
+                send_descriptor(state.clone(), DESCRIPTOR_STORE_PATH, &body).await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(response_code(&value)?, "DescriptorInvalidRequest");
+            let mut lookup = serde_json::json!({"version": 1, "lookup_tokens": []});
+            replace_json_field(
+                &mut lookup,
+                "lookup_tokens",
+                body.get("lookup_tokens")
+                    .cloned()
+                    .ok_or_else(|| "tokens are missing".to_owned())?,
+            )?;
+            let (lookup_status, lookup_value) =
+                send_descriptor(state.clone(), DESCRIPTOR_LOOKUP_PATH, &lookup).await?;
+            assert_eq!(lookup_status, StatusCode::BAD_REQUEST);
+            assert_eq!(response_code(&lookup_value)?, "DescriptorInvalidRequest");
+        }
+
+        // A stale timestamp fails authentication even with a valid signature.
+        let expired_request = signed_descriptor_body(
+            &keypair,
+            &ciphertext,
+            &fixture.lookup_tokens,
+            timestamp.saturating_sub(protocol::TIMESTAMP_WINDOW_SECS + 1),
+        )?;
+        let (expired_status, expired_value) =
+            send_descriptor(state.clone(), DESCRIPTOR_STORE_PATH, &expired_request).await?;
+        assert_eq!(expired_status, StatusCode::UNAUTHORIZED);
+        assert_eq!(response_code(&expired_value)?, "DescriptorAuthError");
+
+        // Ciphertext that does not match its signed length or hash is refused.
+        let mut mismatched = baseline.clone();
+        replace_json_field(
+            &mut mismatched,
+            "ciphertext",
+            serde_json::Value::String(BASE64_STANDARD.encode([1_u8, 2, 3])),
+        )?;
+        let (mismatched_status, mismatched_value) =
+            send_descriptor(state.clone(), DESCRIPTOR_STORE_PATH, &mismatched).await?;
+        assert_eq!(mismatched_status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_code(&mismatched_value)?,
+            "DescriptorInvalidRequest"
+        );
+
+        owner.shutdown().await?;
+        fs::remove_dir_all(directory).map_err(|_| "failed to clean test directory".to_owned())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn descriptor_requests_never_log_tokens_or_publishers() -> Result<(), String> {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_target(false)
+            .with_writer(move || TestLogWriter(Arc::clone(&writer)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (directory, owner, state) = test_state("descriptor-logs")?;
+        let fixture = descriptor_fixture()?;
+        let publisher = fixture
+            .vectors
+            .first()
+            .ok_or_else(|| "fixture vector is missing".to_owned())?;
+        let keypair = fixture_keypair(&publisher.test_only_secret_key)?;
+        let timestamp = unix_time().map_err(|_| "clock unavailable".to_owned())?;
+        let ciphertext = (0_u8..32).collect::<Vec<_>>();
+        let body =
+            signed_descriptor_body(&keypair, &ciphertext, &fixture.lookup_tokens, timestamp)?;
+        let (status, _) = send_descriptor(state.clone(), DESCRIPTOR_STORE_PATH, &body).await?;
+        assert_eq!(status, StatusCode::OK);
+        let lookup = serde_json::json!({
+            "version": 1,
+            "lookup_tokens": fixture.lookup_tokens.clone()
+        });
+        let (lookup_status, _) =
+            send_descriptor(state.clone(), DESCRIPTOR_LOOKUP_PATH, &lookup).await?;
+        assert_eq!(lookup_status, StatusCode::OK);
+
+        state
+            .descriptor_totals
+            .emit(state.storage.descriptor_metrics_snapshot());
+        state.request_totals.emit(state.storage.metrics_snapshot());
+        let logs = {
+            let bytes = output
+                .lock()
+                .map_err(|_| "test log lock poisoned".to_owned())?
+                .clone();
+            String::from_utf8(bytes).map_err(|_| "test log is not UTF-8".to_owned())?
+        };
+        assert!(logs.contains("descriptor_backup_request_totals"));
+        assert!(logs.contains("store_requests=1"));
+        assert!(logs.contains("lookup_requests=1"));
+        assert!(logs.contains("current_records=1"));
+        assert!(!logs.contains(&publisher.npub));
+        assert!(!logs.contains(&fixture.ciphertext_sha256));
+        assert!(!logs.contains(&fixture.ciphertext));
+        for token in &fixture.lookup_tokens {
+            assert!(!logs.contains(token.as_str()));
+        }
+        owner.shutdown().await?;
+        fs::remove_dir_all(directory).map_err(|_| "failed to clean test directory".to_owned())?;
+        Ok(())
+    }
+
+    #[test]
+    fn descriptor_totals_have_fixed_exact_outcomes() {
+        let totals = DescriptorTotals::new(Duration::from_secs(60));
+        let outcomes = [
+            Ok(()),
+            Err(DescriptorApiError::InvalidRequest("test")),
+            Err(DescriptorApiError::Authentication),
+            Err(DescriptorApiError::RecordConflict),
+            Err(DescriptorApiError::PublisherQuota),
+            Err(DescriptorApiError::BlobTooLarge),
+            Err(DescriptorApiError::RateLimited {
+                retry_after_secs: 1,
+                kind: RateLimitKind::Npub,
+            }),
+            Err(DescriptorApiError::Capacity),
+            Err(DescriptorApiError::Internal),
+            Err(DescriptorApiError::RateLimited {
+                retry_after_secs: 1,
+                kind: RateLimitKind::Overflow,
+            }),
+            Err(DescriptorApiError::RateLimited {
+                retry_after_secs: 1,
+                kind: RateLimitKind::Saturation,
+            }),
+            Err(DescriptorApiError::RateLimited {
+                retry_after_secs: 1,
+                kind: RateLimitKind::Admission,
+            }),
+        ];
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            let operation = if index % 2 == 0 {
+                DescriptorOperation::Store
+            } else {
+                DescriptorOperation::Lookup
+            };
+            totals.record(operation, &outcome);
+        }
+        assert_eq!(totals.take(), [1, 1, 1, 1, 1, 1, 4, 1, 1, 1, 1, 1, 1, 6, 6]);
+        assert_eq!(totals.take(), [0; DESCRIPTOR_TOTALS]);
+    }
+
+    #[tokio::test]
+    async fn descriptor_body_ceilings_reject_one_byte_over() -> Result<(), String> {
+        let (directory, owner, state) = test_state("descriptor-body-limits")?;
+        for (uri, limit) in [
+            (
+                DESCRIPTOR_STORE_PATH,
+                ABSOLUTE_MAX_DESCRIPTOR_STORE_BODY_BYTES,
+            ),
+            (DESCRIPTOR_LOOKUP_PATH, SMALL_BODY_LIMIT_BYTES),
+        ] {
+            let at_limit = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("x-real-ip", "192.0.2.12")
+                .body(Body::from(vec![b' '; limit]))
+                .map_err(|_| "failed to build boundary request".to_owned())?;
+            let at_limit_response = test_router(state.clone())
+                .oneshot(at_limit)
+                .await
+                .map_err(|_| "boundary router failed".to_owned())?;
+            assert_eq!(at_limit_response.status(), StatusCode::BAD_REQUEST);
+
+            let over_limit = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("x-real-ip", "192.0.2.12")
+                .body(Body::from(vec![b' '; limit + 1]))
+                .map_err(|_| "failed to build over-limit request".to_owned())?;
+            let over_limit_response = test_router(state.clone())
+                .oneshot(over_limit)
+                .await
+                .map_err(|_| "over-limit router failed".to_owned())?;
+            assert_eq!(over_limit_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        }
+
+        // Missing source identity fails closed on both descriptor routes.
+        for uri in [DESCRIPTOR_STORE_PATH, DESCRIPTOR_LOOKUP_PATH] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .map_err(|_| "failed to build anonymous request".to_owned())?;
+            let response = test_router(state.clone())
+                .oneshot(request)
+                .await
+                .map_err(|_| "anonymous router failed".to_owned())?;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        // The frozen wallet backup routes are unchanged by the new paths.
+        let wallet = Request::builder()
+            .method("POST")
+            .uri(DESCRIPTOR_STORE_PATH)
+            .header("content-type", "application/json")
+            .header("x-real-ip", "192.0.2.12")
+            .body(Body::from("{}"))
+            .map_err(|_| "failed to build descriptor request".to_owned())?;
+        let response = test_router(state.clone())
+            .oneshot(wallet)
+            .await
+            .map_err(|_| "descriptor router failed".to_owned())?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .map_err(|_| "failed to read descriptor response".to_owned())?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| "invalid descriptor response JSON".to_owned())?;
+        assert_eq!(response_code(&value)?, "DescriptorInvalidRequest");
+
+        owner.shutdown().await?;
+        fs::remove_dir_all(directory).map_err(|_| "failed to clean test directory".to_owned())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn descriptor_ingress_error_bodies_match_application() -> Result<(), String> {
+        let config = include_str!("../deploy/nginx/descriptor-backup.conf");
+        let cases = [
+            (
+                DescriptorApiError::InvalidRequest("Descriptor backup request body is invalid."),
+                400,
+            ),
+            (DescriptorApiError::BlobTooLarge, 413),
+            (
+                DescriptorApiError::RateLimited {
+                    retry_after_secs: 60,
+                    kind: RateLimitKind::Saturation,
+                },
+                429,
+            ),
+        ];
+        for (error, status) in cases {
+            let response = error.into_response();
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(
+                response.headers().get("cache-control"),
+                Some(&HeaderValue::from_static("private, no-store, max-age=0"))
+            );
+            let body = to_bytes(response.into_body(), 1024)
+                .await
+                .map_err(|_| "failed to read descriptor error response".to_owned())?;
+            assert_eq!(body.as_ref(), nginx_return_body(config, status)?.as_bytes());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nginx_descriptor_routes_keep_all_admission_bounds() -> Result<(), String> {
+        let locations = include_str!("../deploy/nginx/descriptor-backup.conf");
+        let zones = include_str!("../deploy/nginx/backup-server-http.conf");
+        for directive in [
+            "limit_req_zone $binary_remote_addr zone=descriptor_req_ip:1m rate=5r/s;",
+            "limit_req_zone $server_name zone=descriptor_store_all:1m rate=30r/m;",
+            "limit_req_zone $server_name zone=descriptor_lookup_all:1m rate=60r/m;",
+            "limit_conn_zone $binary_remote_addr zone=descriptor_conn_ip:1m;",
+            "limit_conn_zone $server_name zone=descriptor_store_conn_all:1m;",
+            "limit_conn_zone $server_name zone=descriptor_lookup_conn_all:1m;",
+        ] {
+            assert!(zones.contains(directive), "{directive}");
+        }
+        for path in [DESCRIPTOR_STORE_PATH, DESCRIPTOR_LOOKUP_PATH] {
+            let location = nginx_exact_location(locations, path)?;
+            for directive in [
+                "access_log off;",
+                "error_log stderr crit;",
+                "if ($http_content_length = \"\") { return 400; }",
+                "if ($http_transfer_encoding != \"\") { return 400; }",
+                "limit_conn descriptor_conn_ip 8;",
+                "limit_req_status 429;",
+                "limit_conn_status 429;",
+                "error_page 400 = @descriptor_invalid_request;",
+                "error_page 413 = @descriptor_blob_too_large;",
+                "error_page 429 = @descriptor_rate_limited;",
+                "proxy_set_header X-Real-IP $remote_addr;",
+                "proxy_set_header X-Forwarded-For \"\";",
+                "proxy_set_header Forwarded \"\";",
+                "proxy_request_buffering on;",
+                "proxy_intercept_errors off;",
+            ] {
+                assert!(
+                    location.lines().any(|line| line.trim() == directive),
+                    "{path}: {directive}"
+                );
+            }
+        }
+        let store = nginx_exact_location(locations, DESCRIPTOR_STORE_PATH)?;
+        assert!(store.contains("client_max_body_size 96k;"));
+        assert!(store.contains("limit_conn descriptor_store_conn_all 32;"));
+        assert!(!store.contains("descriptor_lookup_conn_all"));
+        let lookup = nginx_exact_location(locations, DESCRIPTOR_LOOKUP_PATH)?;
+        assert!(lookup.contains("client_max_body_size 8k;"));
+        assert!(lookup.contains("limit_conn descriptor_lookup_conn_all 96;"));
+        assert!(!lookup.contains("descriptor_store_conn_all"));
+        for name in [
+            "descriptor_invalid_request",
+            "descriptor_rate_limited",
+            "descriptor_blob_too_large",
+        ] {
+            let named = nginx_named_location(locations, name)?;
+            for directive in ["internal;", "access_log off;", "error_log stderr crit;"] {
+                assert!(named.lines().any(|line| line.trim() == directive), "{name}");
+            }
+        }
         Ok(())
     }
 }

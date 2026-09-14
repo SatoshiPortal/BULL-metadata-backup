@@ -2604,8 +2604,8 @@ mod tests {
         );
         assert_ne!(first.get("records"), second.get("records"));
 
-        // A cursor that is not one of ours is a bad request, never a silent
-        // restart from the newest page.
+        // A malformed cursor is a bad request, never a silent restart from
+        // the newest page.
         let forged =
             serde_json::json!({"version": 1, "lookup_tokens": [token], "cursor": "not-base64!"});
         let (forged_status, forged_body) =
@@ -2618,6 +2618,19 @@ mod tests {
         let (unknown_status, _) =
             send_descriptor(state.clone(), DESCRIPTOR_LOOKUP_PATH, &unknown).await?;
         assert_eq!(unknown_status, StatusCode::BAD_REQUEST);
+
+        // Possessing a cursor does not grant the original token's read access.
+        let unrelated = serde_json::json!({
+            "version": 1, "lookup_tokens": [descriptor_token(0xfe)], "cursor": cursor
+        });
+        let (unrelated_status, unrelated_body) =
+            send_descriptor(state.clone(), DESCRIPTOR_LOOKUP_PATH, &unrelated).await?;
+        assert_eq!(unrelated_status, StatusCode::OK);
+        assert_eq!(unrelated_body.get("records"), Some(&serde_json::json!([])));
+        assert_eq!(
+            unrelated_body.get("next_cursor"),
+            Some(&serde_json::Value::Null)
+        );
 
         owner.shutdown().await?;
         fs::remove_dir_all(directory).map_err(|_| "failed to clean test directory".to_owned())?;

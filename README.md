@@ -96,10 +96,16 @@ backup-server verify-backup /srv/backup-server/backup-2026-08-26.sqlite3
 ```
 
 `verify-backup` checks what generic tooling cannot: schema shape, admission
-rows, head and byte consistency, and an aggregate digest for before-and-after
-comparison. Always verify the copy, never the live file in its place, and do
-not replace the previous backup until the new copy verifies. Restoration is an
-offline operation: stop the service, restore the verified file, and restart.
+rows, head and byte consistency, and descriptor lookup associations. Each
+descriptor must have 1–16 valid associations; no association may point at a
+missing record. The aggregate digest includes descriptor contents, cursor
+identities and sorted lookup associations for before-and-after comparison.
+Changing a well-formed token changes that digest, but only comparison with a
+trusted earlier digest can identify the change; the server cannot determine
+which token belongs to an encrypted descriptor. Always verify the copy, never
+the live file in its place, and do not replace the previous backup until the
+new copy verifies. Restoration is an offline operation: stop the service,
+restore the verified file, and restart.
 
 ## Check
 

@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::config::{AdmissionBucketConfig, AdmissionConfig};
 use crate::protocol::{
     ABSOLUTE_MAX_CIPHERTEXT_BYTES, ABSOLUTE_MAX_DESCRIPTOR_CIPHERTEXT_BYTES, BackupStream,
-    compute_etag,
+    MAX_DESCRIPTOR_LOOKUP_TOKENS, MIN_DESCRIPTOR_LOOKUP_TOKENS, compute_etag,
 };
 
 const SCHEMA_VERSION: i64 = 2;
@@ -1235,10 +1235,10 @@ fn descriptor_count_for_publisher(
 /// One newest-first page across every publisher, bounded by both a record cap
 /// and a response byte budget.
 ///
-/// A truncated page always names where it stopped, so every matching record is
-/// reachable by asking again from that cursor. Records are immutable and the
-/// order is total, so a repeated request from the same cursor returns the same
-/// page and a new publication only ever appears ahead of one.
+/// A truncated page names where it stopped, so records already stored when a
+/// traversal begins remain reachable. Concurrent publications can fall on
+/// either side of a cursor within the same second; discovering those may need
+/// a fresh traversal. No snapshot or server-side pagination session is held.
 fn lookup_descriptors(
     connection: &Connection,
     tokens: &[[u8; 32]],
@@ -1844,9 +1844,8 @@ fn verify_connection(connection: &Connection) -> Result<VerifyReport, String> {
     })
 }
 
-/// Folds descriptor rows into the aggregate after the head rows. A database
-/// with no descriptor records keeps the version 1 aggregate digest unchanged,
-/// so an upgrade alone does not look like data drift to an operator.
+/// Commits to descriptor contents, cursor identities and canonical lookup
+/// associations. Fixed-width fields and a token count frame each record.
 fn verify_descriptor_rows(
     connection: &Connection,
     aggregate: &mut Sha256,
@@ -1868,7 +1867,8 @@ fn verify_descriptor_rows(
     }
     let mut statement = connection
         .prepare(
-            "SELECT publisher_pubkey, ciphertext, ciphertext_sha256, ciphertext_bytes, created_at
+            "SELECT publisher_pubkey, ciphertext, ciphertext_sha256, ciphertext_bytes, created_at,
+                    record_id
              FROM descriptor_records ORDER BY publisher_pubkey, ciphertext_sha256",
         )
         .map_err(|_| "failed to inspect SQLite descriptor rows".to_owned())?;
@@ -1904,6 +1904,18 @@ fn verify_descriptor_rows(
         if actual != record.ciphertext_sha256 {
             return Err("SQLite descriptor ciphertext commitment mismatch".to_owned());
         }
+        let record_id: [u8; 16] = row
+            .get::<_, Vec<u8>>(5)
+            .map_err(|_| "invalid SQLite descriptor record id".to_owned())?
+            .try_into()
+            .map_err(|_| "invalid SQLite descriptor record id".to_owned())?;
+        let tokens = descriptor_tokens(connection, &publisher, &record.ciphertext_sha256)
+            .map_err(|_| "failed to verify SQLite descriptor lookups".to_owned())?;
+        if !(MIN_DESCRIPTOR_LOOKUP_TOKENS..=MAX_DESCRIPTOR_LOOKUP_TOKENS).contains(&tokens.len()) {
+            return Err("SQLite descriptor lookup count is invalid".to_owned());
+        }
+        let token_count = u64::try_from(tokens.len())
+            .map_err(|_| "SQLite descriptor lookup count is invalid".to_owned())?;
         let size = u64::try_from(record.ciphertext.len())
             .map_err(|_| "SQLite descriptor byte total overflow".to_owned())?;
         bytes = bytes
@@ -1912,10 +1924,16 @@ fn verify_descriptor_rows(
         records = records
             .checked_add(1)
             .ok_or_else(|| "SQLite descriptor count overflow".to_owned())?;
+        aggregate.update(b"descriptor-record-v1\0");
         aggregate.update(publisher);
         aggregate.update(record.ciphertext_sha256);
+        aggregate.update(record_id);
         aggregate.update(record.created_at.to_be_bytes());
         aggregate.update(size.to_be_bytes());
+        aggregate.update(token_count.to_be_bytes());
+        for token in tokens {
+            aggregate.update(token);
+        }
     }
     Ok((records, bytes))
 }
@@ -3133,6 +3151,26 @@ mod tests {
         assert_eq!(tiny.records.len(), 1);
         assert!(tiny.next.is_some());
 
+        // A byte-limited page must advance just like a record-limited page,
+        // even when its first record exceeds the requested byte budget.
+        for byte_budget in [20, 1] {
+            let mut position = None;
+            let mut records = Vec::new();
+            for _ in 0..5 {
+                let page = storage
+                    .lookup_descriptors(vec![shared], descriptor_bounds(4, byte_budget), position)
+                    .await
+                    .map_err(|error| format!("byte-limited lookup failed: {error:?}"))?;
+                records.extend(page.records);
+                position = page.next;
+                if position.is_none() {
+                    break;
+                }
+            }
+            assert!(position.is_none());
+            assert_eq!(records, exact.records);
+        }
+
         owner.shutdown().await?;
         fs::remove_dir_all(parent_of(&path)?).map_err(|_| "cleanup failed".to_owned())?;
         Ok(())
@@ -3158,7 +3196,7 @@ mod tests {
                 refill_interval: Duration::from_secs(86_400),
             },
         };
-        let owner = StorageOwner::start(storage_config)?;
+        let owner = StorageOwner::start(storage_config.clone())?;
         let storage = owner.client();
         let shared = token(0x5a);
         // Three publications share one second, so the page boundary has to fall
@@ -3180,8 +3218,15 @@ mod tests {
             .next
             .ok_or_else(|| "a truncated page must name where it stopped".to_owned())?;
 
-        // The same cursor always returns the same page: records are immutable
-        // and the order is total.
+        // A newer publication and a server restart must not displace the
+        // records remaining behind an already-issued cursor.
+        assert!(matches!(
+            seed_descriptor(&storage, [100; 32], &[100; 12], &[shared], 2_000).await?,
+            DescriptorStoreOutcome::Created { .. }
+        ));
+        owner.shutdown().await?;
+        let owner = StorageOwner::start(storage_config)?;
+        let storage = owner.client();
         let second = storage
             .lookup_descriptors(vec![shared], descriptor_bounds(32, 1 << 20), Some(cursor))
             .await
@@ -3222,11 +3267,11 @@ mod tests {
                 None => break,
             }
         }
-        assert_eq!(walked.len(), 33);
+        assert_eq!(walked.len(), 34);
         let mut unique = walked.clone();
         unique.sort_unstable();
         unique.dedup();
-        assert_eq!(unique.len(), 33);
+        assert_eq!(unique.len(), 34);
 
         owner.shutdown().await?;
         fs::remove_dir_all(parent_of(&path)?).map_err(|_| "cleanup failed".to_owned())?;
@@ -3415,7 +3460,222 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_descriptor_tables_keep_the_version_one_aggregate_digest() -> Result<(), String> {
+    async fn verify_backup_rejects_missing_descriptor_lookups() -> Result<(), String> {
+        let path = test_path("descriptor-missing-lookups")?;
+        let owner = StorageOwner::start(config(path.clone()))?;
+        assert!(matches!(
+            seed_descriptor(&owner.client(), [2; 32], &[6; 16], &[token(6)], 100).await?,
+            DescriptorStoreOutcome::Created { .. }
+        ));
+        owner.shutdown().await?;
+        verify_backup(&path)?;
+
+        let connection =
+            Connection::open(&path).map_err(|_| "failed to reopen database".to_owned())?;
+        connection
+            .execute("DELETE FROM descriptor_lookups", [])
+            .map_err(|_| "failed to remove test lookups".to_owned())?;
+        drop(connection);
+        assert!(verify_backup(&path).is_err());
+        fs::remove_dir_all(parent_of(&path)?).map_err(|_| "cleanup failed".to_owned())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verify_backup_rejects_excess_descriptor_lookups() -> Result<(), String> {
+        let path = test_path("descriptor-excess-lookups")?;
+        let owner = StorageOwner::start(config(path.clone()))?;
+        let tokens = (0_u8..16).map(token).collect::<Vec<_>>();
+        assert!(matches!(
+            seed_descriptor(&owner.client(), [2; 32], &[6; 16], &tokens, 100).await?,
+            DescriptorStoreOutcome::Created { .. }
+        ));
+        owner.shutdown().await?;
+        // The maximum supported association set is valid, one more is not.
+        verify_backup(&path)?;
+        let connection =
+            Connection::open(&path).map_err(|_| "failed to reopen database".to_owned())?;
+        connection
+            .execute(
+                "INSERT INTO descriptor_lookups (token, publisher_pubkey, ciphertext_sha256)
+                 SELECT ?1, publisher_pubkey, ciphertext_sha256 FROM descriptor_records",
+                params![token(16)],
+            )
+            .map_err(|_| "failed to add test lookup".to_owned())?;
+        drop(connection);
+        assert!(verify_backup(&path).is_err());
+        fs::remove_dir_all(parent_of(&path)?).map_err(|_| "cleanup failed".to_owned())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verify_backup_commits_to_descriptor_lookup_associations() -> Result<(), String> {
+        let path = test_path("descriptor-lookup-digest")?;
+        let owner = StorageOwner::start(config(path.clone()))?;
+        for index in 6_u8..8 {
+            assert!(matches!(
+                seed_descriptor(
+                    &owner.client(),
+                    [index; 32],
+                    &[index; 16],
+                    &[token(index)],
+                    100
+                )
+                .await?,
+                DescriptorStoreOutcome::Created { .. }
+            ));
+        }
+        owner.shutdown().await?;
+        let baseline = verify_backup(&path)?;
+        let connection =
+            Connection::open(&path).map_err(|_| "failed to reopen database".to_owned())?;
+        connection
+            .execute(
+                "UPDATE descriptor_lookups SET token = ?1 WHERE token = ?2",
+                params![token(8), token(6)],
+            )
+            .map_err(|_| "failed to change test lookup".to_owned())?;
+        let changed = verify_backup(&path)?;
+        assert_eq!(baseline.descriptor_records, changed.descriptor_records);
+        assert_eq!(baseline.descriptor_bytes, changed.descriptor_bytes);
+        assert_ne!(baseline.aggregate_sha256, changed.aggregate_sha256);
+        assert!(
+            lookup_descriptors(&connection, &[token(6)], descriptor_bounds(32, 1024), None)
+                .map_err(|_| "lookup failed".to_owned())?
+                .records
+                .is_empty()
+        );
+
+        connection
+            .execute(
+                "UPDATE descriptor_lookups SET token = ?1 WHERE token = ?2",
+                params![token(6), token(8)],
+            )
+            .map_err(|_| "failed to restore test lookup".to_owned())?;
+        assert_eq!(
+            baseline.aggregate_sha256,
+            verify_backup(&path)?.aggregate_sha256
+        );
+
+        // The same token set pointing at different records must also differ.
+        connection
+            .execute(
+                "UPDATE descriptor_lookups SET token = CASE token WHEN ?1 THEN ?2 ELSE ?1 END",
+                params![token(6), token(7)],
+            )
+            .map_err(|_| "failed to swap test lookups".to_owned())?;
+        assert_ne!(
+            baseline.aggregate_sha256,
+            verify_backup(&path)?.aggregate_sha256
+        );
+        drop(connection);
+        fs::remove_dir_all(parent_of(&path)?).map_err(|_| "cleanup failed".to_owned())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verify_backup_copy_preserves_descriptor_recovery() -> Result<(), String> {
+        let path = test_path("descriptor-copy-recovery")?;
+        let owner = StorageOwner::start(config(path.clone()))?;
+        let tokens = [token(5), token(6), token(7)];
+        assert!(matches!(
+            seed_descriptor(&owner.client(), [2; 32], &[6; 16], &tokens, 100).await?,
+            DescriptorStoreOutcome::Created { .. }
+        ));
+        owner.shutdown().await?;
+        let baseline = verify_backup(&path)?;
+        let copy = parent_of(&path)?.join("copy.sqlite3");
+        fs::copy(&path, &copy).map_err(|_| "failed to copy offline database".to_owned())?;
+
+        // Insertion order does not affect the commitment to the same links.
+        let connection =
+            Connection::open(&copy).map_err(|_| "failed to open database copy".to_owned())?;
+        connection
+            .execute("DELETE FROM descriptor_lookups", [])
+            .map_err(|_| "failed to reorder test lookups".to_owned())?;
+        for token in tokens.iter().rev() {
+            connection
+                .execute(
+                    "INSERT INTO descriptor_lookups (token, publisher_pubkey, ciphertext_sha256)
+                     SELECT ?1, publisher_pubkey, ciphertext_sha256 FROM descriptor_records",
+                    params![token],
+                )
+                .map_err(|_| "failed to restore test lookup".to_owned())?;
+        }
+        drop(connection);
+        assert_eq!(
+            baseline.aggregate_sha256,
+            verify_backup(&copy)?.aggregate_sha256
+        );
+
+        let restored = StorageOwner::start(config(copy.clone()))?;
+        for token in tokens {
+            let found = restored
+                .client()
+                .lookup_descriptors(vec![token], descriptor_bounds(32, 1024), None)
+                .await
+                .map_err(|error| format!("restored lookup failed: {error:?}"))?;
+            assert!(found.next.is_none());
+            assert_eq!(found.records.len(), 1);
+            let record = found
+                .records
+                .first()
+                .ok_or_else(|| "record missing".to_owned())?;
+            assert_eq!(record.ciphertext, [6; 16]);
+            assert_eq!(record.created_at, 100);
+        }
+        restored.shutdown().await?;
+        assert_eq!(
+            baseline.aggregate_sha256,
+            verify_backup(&copy)?.aggregate_sha256
+        );
+
+        // Changing a persisted cursor identity also changes the digest.
+        let connection =
+            Connection::open(&copy).map_err(|_| "failed to reopen database copy".to_owned())?;
+        let mut record_id: Vec<u8> = connection
+            .query_row("SELECT record_id FROM descriptor_records", [], |row| {
+                row.get(0)
+            })
+            .map_err(|_| "failed to read test record id".to_owned())?;
+        *record_id
+            .first_mut()
+            .ok_or_else(|| "record id missing".to_owned())? ^= 1;
+        connection
+            .execute(
+                "UPDATE descriptor_records SET record_id = ?1",
+                params![record_id],
+            )
+            .map_err(|_| "failed to change test record id".to_owned())?;
+        drop(connection);
+        assert_ne!(
+            baseline.aggregate_sha256,
+            verify_backup(&copy)?.aggregate_sha256
+        );
+
+        // Losing one of several associations stays structurally valid, but
+        // must still change the commitment to the saved recovery paths.
+        let before_loss = verify_backup(&copy)?;
+        let connection =
+            Connection::open(&copy).map_err(|_| "failed to reopen database copy".to_owned())?;
+        connection
+            .execute(
+                "DELETE FROM descriptor_lookups WHERE token = ?1",
+                params![token(5)],
+            )
+            .map_err(|_| "failed to remove test lookup".to_owned())?;
+        drop(connection);
+        assert_ne!(
+            before_loss.aggregate_sha256,
+            verify_backup(&copy)?.aggregate_sha256
+        );
+        fs::remove_dir_all(parent_of(&path)?).map_err(|_| "cleanup failed".to_owned())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn descriptor_records_change_the_digest_without_changing_head_counts()
+    -> Result<(), String> {
         let path = test_path("descriptor-aggregate")?;
         let owner = StorageOwner::start(config(path.clone()))?;
         let npub = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";

@@ -97,15 +97,20 @@ stopped the page before the end of the history, and `null` when the history is
 complete. Asking again with it returns the records that follow, so every
 stored record is reachable however many share one token. A client that stops
 before the cursor runs out has an incomplete result and must say so.
+If a client pauses at its own work limit, it must retain the cursor to let the
+user continue; restarting at the first page cannot reach the remaining history.
 
-The cursor is opaque: build nothing from it and read nothing out of it. A
-cursor the server did not issue is `400 DescriptorInvalidRequest`.
+The cursor is opaque: return it unchanged with the same lookup tokens. A
+malformed or unsupported cursor is `400 DescriptorInvalidRequest`. A cursor
+is only a position, not a credential; it cannot return records outside the
+supplied tokens even if a caller constructs one.
 
 A response never contains a publisher public key or a lookup token, and the
 cursor names neither. Records are ordered by `created_at` descending, then by
-an internal record id, so the order is total: a repeated request from the same
-cursor returns the same page, records are immutable, and a new publication can
-only appear ahead of a cursor, never inside a page already read.
+an internal record id, both descending. Records already stored when traversal
+begins remain reachable. There is no cross-request snapshot: new publications
+can change subsequent responses, including within a creation-time tie. Start
+a fresh traversal to discover publications that fall ahead of the cursor.
 
 There is no delete operation in this version.
 

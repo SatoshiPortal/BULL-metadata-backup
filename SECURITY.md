@@ -58,10 +58,15 @@ and connection pooling are not enabled.
 Startup verifies the configured SQLite pragmas and exact schema, upgrading a
 version 1 database to version 2 by adding descriptor objects only, then
 reconstructs aggregate counters without reading and hashing every ciphertext.
-The `backup` and `verify-backup` commands perform full integrity, row, hash, and
+The `verify-backup` command performs full integrity, row, hash, and
 aggregate verification over both wallet backup heads and descriptor records,
-including that every lookup association points at a record that exists. Backups may retain ciphertext deleted from the live
-database and must follow an explicit retention policy.
+including that each descriptor has 1–16 lookup associations and every
+association points at an existing record. Descriptor cursor identities and
+sorted associations are included in the aggregate digest. A syntactically
+valid token change needs comparison with a trusted baseline to be detected;
+the server cannot validate its relationship to the encrypted descriptor.
+Backups may retain ciphertext deleted from the live database and must follow
+an explicit retention policy.
 
 ## Logging
 

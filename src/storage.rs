@@ -3313,4 +3313,37 @@ mod tests {
         fs::remove_dir_all(parent_of(&path)?).map_err(|_| "cleanup failed".to_owned())?;
         Ok(())
     }
+
+    #[tokio::test]
+    async fn unknown_schema_versions_fail_closed_in_both_directions() -> Result<(), String> {
+        let path = test_path("schema-version-guard")?;
+        let owner = StorageOwner::start(config(path.clone()))?;
+        owner.shutdown().await?;
+
+        // A database written by a newer build is refused, never downgraded.
+        let connection =
+            Connection::open(&path).map_err(|_| "failed to reopen database".to_owned())?;
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .map_err(|_| "failed to set future schema version".to_owned())?;
+        drop(connection);
+        assert!(StorageOwner::start(config(path.clone())).is_err());
+        assert!(verify_backup(&path).is_err());
+
+        // A version 2 database whose descriptor objects were removed is also
+        // refused rather than silently recreated.
+        let connection =
+            Connection::open(&path).map_err(|_| "failed to reopen database".to_owned())?;
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(|_| "failed to restore schema version".to_owned())?;
+        connection
+            .execute_batch("DROP TABLE descriptor_lookups; DROP TABLE descriptor_records;")
+            .map_err(|_| "failed to drop descriptor objects".to_owned())?;
+        drop(connection);
+        assert!(StorageOwner::start(config(path.clone())).is_err());
+        assert!(verify_backup(&path).is_err());
+        fs::remove_dir_all(parent_of(&path)?).map_err(|_| "cleanup failed".to_owned())?;
+        Ok(())
+    }
 }

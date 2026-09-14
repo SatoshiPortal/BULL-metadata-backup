@@ -28,14 +28,15 @@ use protocol::{
     FetchRequest, FetchResponse, MutationResponse, RateLimitKind, SMALL_BODY_LIMIT_BYTES,
     STORE_ACTION, StoreDescriptorRequest, StoreDescriptorResponse, StoreRequest, VERSION,
     canonical_lookup_tokens, compute_etag, decode_canonical_hex, decode_ciphertext,
-    decode_descriptor_ciphertext, decode_descriptor_hex, private_no_store, unix_time,
-    validate_descriptor_version, validate_generation, validate_version,
-    verify_descriptor_signature, verify_request_signature,
+    decode_descriptor_ciphertext, decode_descriptor_cursor, decode_descriptor_hex,
+    encode_descriptor_cursor, private_no_store, unix_time, validate_descriptor_version,
+    validate_generation, validate_version, verify_descriptor_signature, verify_request_signature,
 };
 use sha2::{Digest, Sha256};
 use storage::{
-    CallError, DescriptorLookupBounds, DescriptorMetricsSnapshot, DescriptorStoreOutcome,
-    MutationOutcome, Storage, StorageConfig, StorageMetricsSnapshot, StorageOwner,
+    CallError, DescriptorLookupBounds, DescriptorLookupCursor, DescriptorMetricsSnapshot,
+    DescriptorStoreOutcome, MutationOutcome, Storage, StorageConfig, StorageMetricsSnapshot,
+    StorageOwner,
 };
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
@@ -1110,13 +1111,23 @@ async fn lookup_descriptors_inner(
     let request: DescriptorLookupRequest = descriptor_json_request(request, state).await?;
     validate_descriptor_version(request.version)?;
     let tokens = canonical_lookup_tokens(&request.lookup_tokens)?;
+    let cursor = match request.cursor.as_deref() {
+        Some(value) => {
+            let (created_at, record_id) = decode_descriptor_cursor(value)?;
+            Some(DescriptorLookupCursor {
+                created_at,
+                record_id,
+            })
+        }
+        None => None,
+    };
     state
         .limiter
         .check_descriptor_lookup(&tokens)
         .map_err(map_descriptor_limit)?;
     let outcome = state
         .storage
-        .lookup_descriptors(tokens, state.descriptor_lookup_bounds)
+        .lookup_descriptors(tokens, state.descriptor_lookup_bounds, cursor)
         .await
         .map_err(|error| map_descriptor_storage(error, state.saturation_retry_after_secs))?;
     let mut records = Vec::with_capacity(outcome.records.len());
@@ -1133,7 +1144,9 @@ async fn lookup_descriptors_inner(
     Ok(private_no_store(
         Json(DescriptorLookupResponse {
             version: DESCRIPTOR_VERSION,
-            incomplete: outcome.incomplete,
+            next_cursor: outcome
+                .next
+                .map(|cursor| encode_descriptor_cursor(cursor.created_at, cursor.record_id)),
             records,
         })
         .into_response(),
@@ -2435,9 +2448,10 @@ mod tests {
             let (lookup_status, found) =
                 send_descriptor(state.clone(), DESCRIPTOR_LOOKUP_PATH, &lookup).await?;
             assert_eq!(lookup_status, StatusCode::OK);
-            assert_eq!(
-                found.get("incomplete").and_then(serde_json::Value::as_bool),
-                Some(false)
+            assert!(
+                found
+                    .get("next_cursor")
+                    .is_some_and(serde_json::Value::is_null)
             );
             let records = found
                 .get("records")
@@ -2518,6 +2532,92 @@ mod tests {
                 == Some(fixture.ciphertext.as_str())
         });
         assert!(original_still_present);
+
+        owner.shutdown().await?;
+        fs::remove_dir_all(directory).map_err(|_| "failed to clean test directory".to_owned())?;
+        Ok(())
+    }
+
+    /// Two publishers under one token with a one-record page: the older record
+    /// is reachable only by following the cursor, and the cursor is opaque.
+    #[tokio::test]
+    async fn descriptor_lookup_pages_through_history_by_cursor() -> Result<(), String> {
+        let (directory, owner, mut state) = test_state("descriptor-paging")?;
+        state.descriptor_lookup_bounds = DescriptorLookupBounds {
+            record_cap: 1,
+            byte_budget: 1 << 20,
+        };
+        let fixture = descriptor_fixture()?;
+        let timestamp = unix_time().map_err(|_| "clock unavailable".to_owned())?;
+        for (index, vector) in fixture.vectors.iter().take(2).enumerate() {
+            let keypair = fixture_keypair(&vector.test_only_secret_key)?;
+            let ciphertext = vec![u8::try_from(index).unwrap_or(0); 32 + index];
+            let body =
+                signed_descriptor_body(&keypair, &ciphertext, &fixture.lookup_tokens, timestamp)?;
+            let (status, _) = send_descriptor(state.clone(), DESCRIPTOR_STORE_PATH, &body).await?;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let token = fixture
+            .lookup_tokens
+            .first()
+            .ok_or_else(|| "fixture token is missing".to_owned())?;
+
+        let lookup = serde_json::json!({"version": 1, "lookup_tokens": [token]});
+        let (status, first) =
+            send_descriptor(state.clone(), DESCRIPTOR_LOOKUP_PATH, &lookup).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            first
+                .get("records")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        let cursor = first
+            .get("next_cursor")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "a truncated page must carry a cursor".to_owned())?
+            .to_owned();
+        // The cursor names a position, never a publisher or a token.
+        for vector in &fixture.vectors {
+            assert!(!cursor.contains(&vector.npub));
+        }
+        for other in &fixture.lookup_tokens {
+            assert!(!cursor.contains(other.as_str()));
+        }
+
+        let next = serde_json::json!({"version": 1, "lookup_tokens": [token], "cursor": cursor});
+        let (next_status, second) =
+            send_descriptor(state.clone(), DESCRIPTOR_LOOKUP_PATH, &next).await?;
+        assert_eq!(next_status, StatusCode::OK);
+        assert_eq!(
+            second
+                .get("records")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert!(
+            second
+                .get("next_cursor")
+                .is_some_and(serde_json::Value::is_null)
+        );
+        assert_ne!(first.get("records"), second.get("records"));
+
+        // A cursor that is not one of ours is a bad request, never a silent
+        // restart from the newest page.
+        let forged =
+            serde_json::json!({"version": 1, "lookup_tokens": [token], "cursor": "not-base64!"});
+        let (forged_status, forged_body) =
+            send_descriptor(state.clone(), DESCRIPTOR_LOOKUP_PATH, &forged).await?;
+        assert_eq!(forged_status, StatusCode::BAD_REQUEST);
+        assert_eq!(response_code(&forged_body)?, "DescriptorInvalidRequest");
+
+        // Unknown fields are still refused, cursor or no cursor.
+        let unknown = serde_json::json!({"version": 1, "lookup_tokens": [token], "page": cursor});
+        let (unknown_status, _) =
+            send_descriptor(state.clone(), DESCRIPTOR_LOOKUP_PATH, &unknown).await?;
+        assert_eq!(unknown_status, StatusCode::BAD_REQUEST);
 
         owner.shutdown().await?;
         fs::remove_dir_all(directory).map_err(|_| "failed to clean test directory".to_owned())?;

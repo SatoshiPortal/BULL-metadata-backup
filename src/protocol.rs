@@ -455,6 +455,10 @@ pub struct StoreDescriptorRequest {
 pub struct DescriptorLookupRequest {
     pub version: u8,
     pub lookup_tokens: Vec<String>,
+    /// Where to resume, taken verbatim from a previous response. Absent asks
+    /// for the newest page.
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -475,8 +479,44 @@ pub struct DescriptorRecordView {
 #[derive(Serialize)]
 pub struct DescriptorLookupResponse {
     pub version: u8,
-    pub incomplete: bool,
+    /// Present when matching records remain after this page. Sending it back
+    /// unchanged returns the next page; absent means the history is complete.
+    pub next_cursor: Option<String>,
     pub records: Vec<DescriptorRecordView>,
+}
+
+/// The wire form of a lookup position: one version byte, the 8-byte creation
+/// time and the record's 16-byte id, base64 as every other opaque field is.
+///
+/// It is meaningless to a client, which must return it verbatim. A forged one
+/// only names a position inside records the token already opens, so nothing is
+/// authenticated here and no server secret exists to authenticate it with.
+pub const DESCRIPTOR_CURSOR_VERSION: u8 = 1;
+pub const DESCRIPTOR_CURSOR_BYTES: usize = 25;
+
+pub fn encode_descriptor_cursor(created_at: i64, record_id: [u8; 16]) -> String {
+    let mut bytes = Vec::with_capacity(DESCRIPTOR_CURSOR_BYTES);
+    bytes.push(DESCRIPTOR_CURSOR_VERSION);
+    bytes.extend_from_slice(&created_at.to_be_bytes());
+    bytes.extend_from_slice(&record_id);
+    BASE64_STANDARD.encode(bytes)
+}
+
+pub fn decode_descriptor_cursor(value: &str) -> Result<(i64, [u8; 16]), DescriptorApiError> {
+    let invalid = DescriptorApiError::InvalidRequest("Descriptor lookup cursor is not valid.");
+    let decoded = BASE64_STANDARD.decode(value).map_err(|_| invalid)?;
+    if decoded.len() != DESCRIPTOR_CURSOR_BYTES
+        || decoded[0] != DESCRIPTOR_CURSOR_VERSION
+        || BASE64_STANDARD.encode(&decoded) != value
+    {
+        return Err(invalid);
+    }
+    let created_at = i64::from_be_bytes(decoded[1..9].try_into().map_err(|_| invalid)?);
+    let record_id: [u8; 16] = decoded[9..].try_into().map_err(|_| invalid)?;
+    if created_at < 0 {
+        return Err(invalid);
+    }
+    Ok((created_at, record_id))
 }
 
 /// Descriptor-record errors. Separate from [`ApiError`] so that the frozen

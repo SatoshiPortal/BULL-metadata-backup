@@ -74,11 +74,13 @@ const ADMISSION_BUCKET_NAMES: [&str; 2] = ["new_heads", "total_growth_bytes"];
 const DESCRIPTOR_TABLE_SCHEMA: &str = "CREATE TABLE descriptor_records (
     publisher_pubkey    BLOB    NOT NULL,
     ciphertext_sha256   BLOB    NOT NULL,
+    record_id           BLOB    NOT NULL UNIQUE,
     ciphertext          BLOB    NOT NULL,
     ciphertext_bytes    INTEGER NOT NULL,
     created_at          INTEGER NOT NULL,
     CONSTRAINT descriptor_publisher_length CHECK (length(publisher_pubkey) = 32),
     CONSTRAINT descriptor_hash_length CHECK (length(ciphertext_sha256) = 32),
+    CONSTRAINT descriptor_record_id_length CHECK (length(record_id) = 16),
     CONSTRAINT descriptor_bytes_match CHECK (
         ciphertext_bytes = length(ciphertext)
         AND ciphertext_bytes > 0
@@ -155,10 +157,21 @@ pub struct DescriptorRecord {
     pub created_at: i64,
 }
 
+/// Where a lookup stopped, so the next request resumes exactly after it.
+///
+/// It names a position in the newest-first order and nothing else: no
+/// publisher, no token, and no fact about any other record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorLookupCursor {
+    pub created_at: i64,
+    pub record_id: [u8; 16],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DescriptorLookupOutcome {
     pub records: Vec<DescriptorRecord>,
-    pub incomplete: bool,
+    /// Set when records matching the same tokens remain after this page.
+    pub next: Option<DescriptorLookupCursor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,6 +272,7 @@ enum Command {
     LookupDescriptors {
         tokens: Vec<[u8; 32]>,
         bounds: DescriptorLookupBounds,
+        cursor: Option<DescriptorLookupCursor>,
         reply: oneshot::Sender<Result<DescriptorLookupOutcome, StorageError>>,
     },
     Cleanup {
@@ -577,11 +591,13 @@ impl Storage {
         &self,
         tokens: Vec<[u8; 32]>,
         bounds: DescriptorLookupBounds,
+        cursor: Option<DescriptorLookupCursor>,
     ) -> Result<DescriptorLookupOutcome, CallError> {
         let (reply, response) = oneshot::channel();
         self.try_send(Command::LookupDescriptors {
             tokens,
             bounds,
+            cursor,
             reply,
         })?;
         response
@@ -739,9 +755,10 @@ impl Actor {
                 Command::LookupDescriptors {
                     tokens,
                     bounds,
+                    cursor,
                     reply,
                 } => {
-                    let result = lookup_descriptors(&self.connection, &tokens, bounds);
+                    let result = lookup_descriptors(&self.connection, &tokens, bounds, cursor);
                     send_response(reply, result);
                 }
                 Command::Cleanup {
@@ -994,9 +1011,13 @@ impl Actor {
         let bytes_column = i64::try_from(new_bytes).map_err(|_| StorageError::InvalidData)?;
         transaction
             .execute(
+                // record_id orders records inside one created_at second and
+                // continues a page. It is random rather than derived so that a
+                // cursor names a position without naming a publisher.
                 "INSERT INTO descriptor_records (
-                     publisher_pubkey, ciphertext_sha256, ciphertext, ciphertext_bytes, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                     publisher_pubkey, ciphertext_sha256, record_id,
+                     ciphertext, ciphertext_bytes, created_at
+                 ) VALUES (?1, ?2, randomblob(16), ?3, ?4, ?5)",
                 params![publisher, ciphertext_sha256, ciphertext, bytes_column, now],
             )
             .map_err(|_| StorageError::Database)?;
@@ -1211,12 +1232,18 @@ fn descriptor_count_for_publisher(
     u64::try_from(count).map_err(|_| StorageError::InvalidData)
 }
 
-/// Newest first across every publisher, bounded by both a record cap and a
-/// response byte budget. Truncation is reported, never hidden.
+/// One newest-first page across every publisher, bounded by both a record cap
+/// and a response byte budget.
+///
+/// A truncated page always names where it stopped, so every matching record is
+/// reachable by asking again from that cursor. Records are immutable and the
+/// order is total, so a repeated request from the same cursor returns the same
+/// page and a new publication only ever appears ahead of one.
 fn lookup_descriptors(
     connection: &Connection,
     tokens: &[[u8; 32]],
     bounds: DescriptorLookupBounds,
+    cursor: Option<DescriptorLookupCursor>,
 ) -> Result<DescriptorLookupOutcome, StorageError> {
     if tokens.is_empty() || bounds.record_cap == 0 {
         return Err(StorageError::InvalidData);
@@ -1224,8 +1251,22 @@ fn lookup_descriptors(
     let placeholders = std::iter::repeat_n("?", tokens.len())
         .collect::<Vec<_>>()
         .join(", ");
+    let token_count = tokens.len();
+    // Records sharing a created_at second are ordered by their random id, so
+    // the pair is a total order and a tie is never split away unreachably.
+    let after = if cursor.is_some() {
+        format!(
+            "AND (r.created_at < ?{at}
+                  OR (r.created_at = ?{at} AND r.record_id < ?{id}))",
+            at = token_count + 1,
+            id = token_count + 2,
+        )
+    } else {
+        String::new()
+    };
+    let limit_index = token_count + if cursor.is_some() { 3 } else { 1 };
     let sql = format!(
-        "SELECT r.ciphertext, r.ciphertext_sha256, r.ciphertext_bytes, r.created_at
+        "SELECT r.ciphertext, r.ciphertext_sha256, r.ciphertext_bytes, r.created_at, r.record_id
          FROM (
              SELECT DISTINCT publisher_pubkey, ciphertext_sha256
              FROM descriptor_lookups WHERE token IN ({placeholders})
@@ -1233,9 +1274,9 @@ fn lookup_descriptors(
          JOIN descriptor_records r
            ON r.publisher_pubkey = matched.publisher_pubkey
           AND r.ciphertext_sha256 = matched.ciphertext_sha256
-         ORDER BY r.created_at DESC, r.publisher_pubkey, r.ciphertext_sha256
-         LIMIT ?{}",
-        tokens.len().saturating_add(1)
+         {after}
+         ORDER BY r.created_at DESC, r.record_id DESC
+         LIMIT ?{limit_index}"
     );
     // One row past the cap distinguishes an exact fit from a truncated page.
     let probe = i64::try_from(bounds.record_cap)
@@ -1249,6 +1290,10 @@ fn lookup_descriptors(
         .iter()
         .map(|token| rusqlite::types::Value::Blob(token.to_vec()))
         .collect();
+    if let Some(cursor) = cursor {
+        values.push(rusqlite::types::Value::Integer(cursor.created_at));
+        values.push(rusqlite::types::Value::Blob(cursor.record_id.to_vec()));
+    }
     values.push(rusqlite::types::Value::Integer(probe));
     let rows = statement
         .query_map(params_from_iter(values), |row| {
@@ -1257,35 +1302,43 @@ fn lookup_descriptors(
                 row.get::<_, Vec<u8>>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
             ))
         })
         .map_err(|_| StorageError::Database)?;
     let mut records = Vec::new();
-    let mut incomplete = false;
+    let mut next = None;
     let mut used_bytes = 0_u64;
+    let mut last: Option<DescriptorLookupCursor> = None;
     for row in rows {
-        let record = descriptor_from_raw(row.map_err(|_| StorageError::Database)?)?;
+        let (ciphertext, hash, declared_bytes, created_at, record_id) =
+            row.map_err(|_| StorageError::Database)?;
+        let record_id: [u8; 16] = record_id
+            .try_into()
+            .map_err(|_| StorageError::InvalidData)?;
+        let record = descriptor_from_raw((ciphertext, hash, declared_bytes, created_at))?;
         if records.len() >= bounds.record_cap {
-            incomplete = true;
+            next = last;
             break;
         }
         let size = u64::try_from(record.ciphertext.len()).map_err(|_| StorageError::InvalidData)?;
         let projected = used_bytes
             .checked_add(size)
             .ok_or(StorageError::InvalidData)?;
-        // The newest record is always returned, even alone, so a single large
-        // publication is never unreachable through its own token.
+        // The first record of a page is always returned, even alone, so a
+        // single large publication is never unreachable through its own token.
         if !records.is_empty() && projected > bounds.byte_budget {
-            incomplete = true;
+            next = last;
             break;
         }
         used_bytes = projected;
+        last = Some(DescriptorLookupCursor {
+            created_at: record.created_at,
+            record_id,
+        });
         records.push(record);
     }
-    Ok(DescriptorLookupOutcome {
-        records,
-        incomplete,
-    })
+    Ok(DescriptorLookupOutcome { records, next })
 }
 
 fn reconstruct_descriptor_counters(connection: &Connection) -> Result<(u64, u64), String> {
@@ -2886,10 +2939,10 @@ mod tests {
         );
         for single in tokens {
             let found = storage
-                .lookup_descriptors(vec![single], descriptor_bounds(32, 1 << 20))
+                .lookup_descriptors(vec![single], descriptor_bounds(32, 1 << 20), None)
                 .await
                 .map_err(|error| format!("lookup failed: {error:?}"))?;
-            assert!(!found.incomplete);
+            assert!(found.next.is_none());
             assert_eq!(found.records.len(), 1);
             let record = found
                 .records
@@ -2902,11 +2955,11 @@ mod tests {
 
         // An unknown token is an empty result, never an error.
         let unknown = storage
-            .lookup_descriptors(vec![token(0xee)], descriptor_bounds(32, 1 << 20))
+            .lookup_descriptors(vec![token(0xee)], descriptor_bounds(32, 1 << 20), None)
             .await
             .map_err(|error| format!("unknown lookup failed: {error:?}"))?;
         assert!(unknown.records.is_empty());
-        assert!(!unknown.incomplete);
+        assert!(unknown.next.is_none());
 
         // Identical content and token set is an idempotent success that keeps
         // the original creation time.
@@ -2949,7 +3002,7 @@ mod tests {
             DescriptorStoreOutcome::Created { created_at: 400 }
         );
         let both = storage
-            .lookup_descriptors(vec![token(0x11)], descriptor_bounds(32, 1 << 20))
+            .lookup_descriptors(vec![token(0x11)], descriptor_bounds(32, 1 << 20), None)
             .await
             .map_err(|error| format!("shared lookup failed: {error:?}"))?;
         assert_eq!(both.records.len(), 2);
@@ -2968,7 +3021,7 @@ mod tests {
             DescriptorStoreOutcome::Conflict
         );
         let unchanged = storage
-            .lookup_descriptors(vec![token(0x11)], descriptor_bounds(32, 1 << 20))
+            .lookup_descriptors(vec![token(0x11)], descriptor_bounds(32, 1 << 20), None)
             .await
             .map_err(|error| format!("post-conflict lookup failed: {error:?}"))?;
         assert_eq!(unchanged.records.len(), 2);
@@ -2983,7 +3036,7 @@ mod tests {
             DescriptorStoreOutcome::Created { created_at: 600 }
         );
         let generations = storage
-            .lookup_descriptors(vec![token(0x22)], descriptor_bounds(32, 1 << 20))
+            .lookup_descriptors(vec![token(0x22)], descriptor_bounds(32, 1 << 20), None)
             .await
             .map_err(|error| format!("generation lookup failed: {error:?}"))?;
         assert_eq!(generations.records.len(), 3);
@@ -3044,10 +3097,10 @@ mod tests {
             ));
         }
         let capped = storage
-            .lookup_descriptors(vec![shared], descriptor_bounds(2, 1 << 20))
+            .lookup_descriptors(vec![shared], descriptor_bounds(2, 1 << 20), None)
             .await
             .map_err(|error| format!("capped lookup failed: {error:?}"))?;
-        assert!(capped.incomplete);
+        assert!(capped.next.is_some());
         assert_eq!(capped.records.len(), 2);
         assert_eq!(
             capped
@@ -3059,26 +3112,121 @@ mod tests {
         );
 
         let exact = storage
-            .lookup_descriptors(vec![shared], descriptor_bounds(4, 1 << 20))
+            .lookup_descriptors(vec![shared], descriptor_bounds(4, 1 << 20), None)
             .await
             .map_err(|error| format!("exact lookup failed: {error:?}"))?;
-        assert!(!exact.incomplete);
+        assert!(exact.next.is_none());
         assert_eq!(exact.records.len(), 4);
 
         let budgeted = storage
-            .lookup_descriptors(vec![shared], descriptor_bounds(4, 20))
+            .lookup_descriptors(vec![shared], descriptor_bounds(4, 20), None)
             .await
             .map_err(|error| format!("budgeted lookup failed: {error:?}"))?;
-        assert!(budgeted.incomplete);
+        assert!(budgeted.next.is_some());
         assert_eq!(budgeted.records.len(), 1);
 
         // A single record larger than the whole budget is still returned.
         let tiny = storage
-            .lookup_descriptors(vec![shared], descriptor_bounds(4, 1))
+            .lookup_descriptors(vec![shared], descriptor_bounds(4, 1), None)
             .await
             .map_err(|error| format!("tiny-budget lookup failed: {error:?}"))?;
         assert_eq!(tiny.records.len(), 1);
-        assert!(tiny.incomplete);
+        assert!(tiny.next.is_some());
+
+        owner.shutdown().await?;
+        fs::remove_dir_all(parent_of(&path)?).map_err(|_| "cleanup failed".to_owned())?;
+        Ok(())
+    }
+
+    /// The reviewer's reproduction: 33 records under one token, a 32-record
+    /// page, and every record still reachable by following the cursor.
+    #[tokio::test]
+    async fn descriptor_lookup_reaches_every_record_through_its_cursor() -> Result<(), String> {
+        let path = test_path("descriptor-cursor")?;
+        let mut storage_config = config(path.clone());
+        storage_config.max_descriptor_records = 64;
+        storage_config.max_descriptor_records_per_publisher = 64;
+        storage_config.admission = AdmissionConfig {
+            new_heads: AdmissionBucketConfig {
+                capacity: 1,
+                refill: 1,
+                refill_interval: Duration::from_secs(86_400),
+            },
+            total_growth_bytes: AdmissionBucketConfig {
+                capacity: 1 << 20,
+                refill: 1 << 20,
+                refill_interval: Duration::from_secs(86_400),
+            },
+        };
+        let owner = StorageOwner::start(storage_config)?;
+        let storage = owner.client();
+        let shared = token(0x5a);
+        // Three publications share one second, so the page boundary has to fall
+        // inside a tie at least once.
+        for index in 0_u8..33 {
+            let created_at = 1_000 + i64::from(index / 3);
+            assert!(matches!(
+                seed_descriptor(&storage, [index; 32], &[index; 12], &[shared], created_at).await?,
+                DescriptorStoreOutcome::Created { .. }
+            ));
+        }
+
+        let first = storage
+            .lookup_descriptors(vec![shared], descriptor_bounds(32, 1 << 20), None)
+            .await
+            .map_err(|error| format!("first page failed: {error:?}"))?;
+        assert_eq!(first.records.len(), 32);
+        let cursor = first
+            .next
+            .ok_or_else(|| "a truncated page must name where it stopped".to_owned())?;
+
+        // The same cursor always returns the same page: records are immutable
+        // and the order is total.
+        let second = storage
+            .lookup_descriptors(vec![shared], descriptor_bounds(32, 1 << 20), Some(cursor))
+            .await
+            .map_err(|error| format!("second page failed: {error:?}"))?;
+        let repeated = storage
+            .lookup_descriptors(vec![shared], descriptor_bounds(32, 1 << 20), Some(cursor))
+            .await
+            .map_err(|error| format!("repeat page failed: {error:?}"))?;
+        assert_eq!(second.records, repeated.records);
+        assert_eq!(second.records.len(), 1);
+        assert!(second.next.is_none());
+
+        // Every stored record was seen exactly once across the two pages.
+        let mut seen: Vec<[u8; 32]> = first
+            .records
+            .iter()
+            .chain(second.records.iter())
+            .map(|record| record.ciphertext_sha256)
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 33);
+
+        // A one-record page walks the whole tie group without repeating or
+        // skipping a record.
+        let mut walked = Vec::new();
+        let mut position = None;
+        for _ in 0..40 {
+            let page = storage
+                .lookup_descriptors(vec![shared], descriptor_bounds(1, 1 << 20), position)
+                .await
+                .map_err(|error| format!("walk failed: {error:?}"))?;
+            for record in &page.records {
+                walked.push(record.ciphertext_sha256);
+            }
+            match page.next {
+                Some(cursor) => position = Some(cursor),
+                None => break,
+            }
+        }
+        assert_eq!(walked.len(), 33);
+        let mut unique = walked.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 33);
 
         owner.shutdown().await?;
         fs::remove_dir_all(parent_of(&path)?).map_err(|_| "cleanup failed".to_owned())?;
@@ -3149,7 +3297,7 @@ mod tests {
             DescriptorStoreOutcome::AdmissionLimited
         );
         let empty = storage
-            .lookup_descriptors(vec![token(2)], descriptor_bounds(4, 1 << 20))
+            .lookup_descriptors(vec![token(2)], descriptor_bounds(4, 1 << 20), None)
             .await
             .map_err(|error| format!("lookup failed: {error:?}"))?;
         assert!(empty.records.is_empty());

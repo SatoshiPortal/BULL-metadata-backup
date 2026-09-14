@@ -1,13 +1,26 @@
 # backup-server
 
-`backup-server` stores one authenticated, opaque encrypted backup head per
-BIP340 public key. It cannot decrypt or interpret stored data.
+`backup-server` stores opaque encrypted data for BIP340 public keys. It cannot
+decrypt or interpret anything it stores.
 
-The public API has three operations:
+It serves two independent resources.
+
+**Wallet backups** are one authenticated head per public key, replaced in
+place:
 
 - `POST /api/v1/wallet-backups/fetch`
 - `PUT /api/v1/wallet-backups`
 - `DELETE /api/v1/wallet-backups`
+
+**Private descriptor records** are immutable publications addressed by their
+ciphertext hash within a publisher namespace, retrieved by opaque lookup
+tokens the client derives and the server never interprets:
+
+- `POST /api/v1/descriptor-backups`
+- `POST /api/v1/descriptor-backups/lookup`
+
+The descriptor resource is additive. It changes no wallet backup request
+format, response, or semantic.
 
 ## Build
 
@@ -31,8 +44,11 @@ backup-server serve
 Four variables are required: `BACKUP_SERVER_DB_PATH`,
 `BACKUP_SERVER_MAX_LIVE_BYTES`, `BACKUP_SERVER_MAX_HEADS`, and
 `BACKUP_SERVER_LIMITER_MAX_SUBJECTS`. The optional variables — object size
-ceilings, rate windows, admission budgets, concurrency, timeouts, and log
-level — are enumerated with their development defaults in `src/config.rs`.
+ceilings, rate windows, admission budgets, concurrency, timeouts, descriptor
+record and lookup bounds, and log level — are enumerated with their
+development defaults in `src/config.rs`. Descriptor variables all carry
+`DESCRIPTOR` in their name and every one of them is optional, so an existing
+deployment starts unchanged.
 Production limits are set in the deployment environment and are not
 published. The Nginx files under `deploy/` are structural templates whose
 rates are likewise tuned privately before deployment.
@@ -52,6 +68,20 @@ byte delta — new heads and tombstone revivals included — draws from a
 persistent growth bucket. Deletes never refund these budgets. Admission
 checks and mutations commit in one SQLite transaction, so concurrent requests
 cannot overshoot a bucket.
+
+Descriptor records draw from the same persistent growth bucket, and
+deliberately not from the head bucket, so descriptor traffic cannot block
+wallet backup head creation. Their counts are additionally bounded per
+publisher and across the service.
+
+## Upgrade
+
+The database carries a schema version. A version 1 database is upgraded to
+version 2 on startup by adding the two descriptor tables and their index; the
+upgrade never reads or writes `wallet_backup_heads`, and a fresh database is
+built by running the same migration. An aggregate verification digest is
+unchanged by the upgrade alone, so an operator comparing before and after
+sees drift only when descriptor records actually exist.
 
 ## Back up
 
@@ -83,5 +113,6 @@ cargo doc --no-deps --document-private-items --locked
 cargo audit
 ```
 
-See [docs/protocol-v1.md](docs/protocol-v1.md) for the wire contract and
+See [docs/protocol-v1.md](docs/protocol-v1.md) and
+[docs/descriptor-v1.md](docs/descriptor-v1.md) for the wire contracts, and
 [SECURITY.md](SECURITY.md) for the security boundary.

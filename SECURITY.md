@@ -3,8 +3,21 @@
 ## Boundary
 
 The service accepts encrypted bytes, BIP340 public keys and signatures, hashes,
-generation counters, and timestamps. It never receives plaintext or encryption
-keys.
+generation counters, timestamps, and opaque 32-byte descriptor lookup tokens.
+It never receives plaintext or encryption keys, and it never derives or
+interprets a lookup token.
+
+Descriptor lookup is deliberately unauthenticated: knowing a lookup token is
+the read capability for the records it points at. That read capability confers
+no authority to create, change, or remove anything, and one publisher cannot
+alter another publisher's record even when both publish under the same token.
+A lookup result is a set of untrusted candidates; the service cannot prove
+that a token belongs to any particular descriptor, so membership and policy
+validation belong to the client after decryption.
+
+HTTPS protects the transport. It is not a promise that the operator cannot
+correlate records, tokens, or traffic; separate signing identities remove the
+direct public-key join but not timing, address, or ciphertext correlation.
 
 The application rejects malformed input, replay outside the signed window,
 invalid signatures, stale writes, oversized objects, capacity growth beyond
@@ -42,10 +55,12 @@ and connection pooling are not enabled.
 
 ## Storage
 
-Startup verifies the configured SQLite pragmas and exact schema, then
+Startup verifies the configured SQLite pragmas and exact schema, upgrading a
+version 1 database to version 2 by adding descriptor objects only, then
 reconstructs aggregate counters without reading and hashing every ciphertext.
 The `backup` and `verify-backup` commands perform full integrity, row, hash, and
-aggregate verification. Backups may retain ciphertext deleted from the live
+aggregate verification over both wallet backup heads and descriptor records,
+including that every lookup association points at a record that exists. Backups may retain ciphertext deleted from the live
 database and must follow an explicit retention policy.
 
 ## Logging
@@ -57,9 +72,12 @@ rate-limit classes.
 Lifecycle logs are limited to static events, cleanup counts, backup results,
 storage health, and process failures.
 
+A second fixed event per interval carries the descriptor request and storage
+totals under the same rules.
+
 Logs must not contain per-request or per-user ciphertext, public keys,
-signatures, hashes, ETags, source addresses, headers, request bodies, SQL
-values, or database paths. The `aggregate_sha256` printed to an operator's
+signatures, hashes, ETags, lookup tokens, digests of lookup tokens, source
+addresses, headers, request bodies, SQL values, or database paths. The `aggregate_sha256` printed to an operator's
 standard output by `backup` and `verify-backup` is a database-wide verification
 digest, not a request log or per-user identifier, and is exempt for
 before-and-after verification.

@@ -206,28 +206,39 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = self.status();
-        let code = self.code();
-        let mut response = private_no_store(
-            (
-                status,
-                Json(json!({
-                    "status": "ERROR",
-                    "code": code,
-                    "reason": self.reason(),
-                })),
-            )
-                .into_response(),
-        );
-        if let Self::RateLimited {
-            retry_after_secs, ..
-        } = self
-            && let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string())
-        {
-            response.headers_mut().insert(header::RETRY_AFTER, value);
-        }
-        response
+        let retry_after = match self {
+            Self::RateLimited {
+                retry_after_secs, ..
+            } => Some(retry_after_secs),
+            _ => None,
+        };
+        error_response(self.status(), self.code(), self.reason(), retry_after)
     }
+}
+
+fn error_response(
+    status: StatusCode,
+    code: &'static str,
+    reason: &'static str,
+    retry_after_secs: Option<u64>,
+) -> Response {
+    let mut response = private_no_store(
+        (
+            status,
+            Json(json!({
+                "status": "ERROR",
+                "code": code,
+                "reason": reason,
+            })),
+        )
+            .into_response(),
+    );
+    if let Some(seconds) = retry_after_secs
+        && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
+    {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 pub fn private_no_store(mut response: Response) -> Response {
@@ -251,21 +262,24 @@ pub fn validate_version(version: u8) -> Result<(), ApiError> {
     }
 }
 
-pub fn decode_canonical_hex<const N: usize>(
-    value: &str,
-    reason: &'static str,
-) -> Result<[u8; N], ApiError> {
+/// Canonical lowercase fixed-width hexadecimal only; every protocol hex field
+/// decodes through this one function.
+fn decode_hex_array<const N: usize>(value: &str) -> Option<[u8; N]> {
     if value.len() != N * 2
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        return Err(ApiError::InvalidRequest(reason));
+        return None;
     }
-    let decoded = hex::decode(value).map_err(|_| ApiError::InvalidRequest(reason))?;
-    decoded
-        .try_into()
-        .map_err(|_| ApiError::InvalidRequest(reason))
+    hex::decode(value).ok()?.try_into().ok()
+}
+
+pub fn decode_canonical_hex<const N: usize>(
+    value: &str,
+    reason: &'static str,
+) -> Result<[u8; N], ApiError> {
+    decode_hex_array(value).ok_or(ApiError::InvalidRequest(reason))
 }
 
 pub fn validate_generation(generation: u64) -> Result<i64, ApiError> {
@@ -378,19 +392,36 @@ pub fn unix_time() -> Result<u64, ApiError> {
         .map_err(|_| ApiError::Internal)
 }
 
-pub fn decode_ciphertext(value: &str, max_bytes: usize) -> Result<Vec<u8>, ApiError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CiphertextError {
+    NotBase64,
+    NotCanonical,
+    TooLarge,
+}
+
+pub fn decode_base64_ciphertext(value: &str, max_bytes: usize) -> Result<Vec<u8>, CiphertextError> {
     let decoded = BASE64_STANDARD
         .decode(value)
-        .map_err(|_| ApiError::InvalidRequest("Wallet backup ciphertext is not base64."))?;
+        .map_err(|_| CiphertextError::NotBase64)?;
     if decoded.len() > max_bytes {
-        return Err(ApiError::BlobTooLarge);
+        return Err(CiphertextError::TooLarge);
     }
     if BASE64_STANDARD.encode(&decoded) != value {
-        return Err(ApiError::InvalidRequest(
-            "Wallet backup ciphertext base64 is not canonical.",
-        ));
+        return Err(CiphertextError::NotCanonical);
     }
     Ok(decoded)
+}
+
+pub fn decode_ciphertext(value: &str, max_bytes: usize) -> Result<Vec<u8>, ApiError> {
+    decode_base64_ciphertext(value, max_bytes).map_err(|error| match error {
+        CiphertextError::NotBase64 => {
+            ApiError::InvalidRequest("Wallet backup ciphertext is not base64.")
+        }
+        CiphertextError::NotCanonical => {
+            ApiError::InvalidRequest("Wallet backup ciphertext base64 is not canonical.")
+        }
+        CiphertextError::TooLarge => ApiError::BlobTooLarge,
+    })
 }
 
 #[cfg(test)]

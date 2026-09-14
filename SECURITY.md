@@ -4,8 +4,8 @@
 
 The service accepts encrypted bytes, BIP340 public keys and signatures, hashes,
 generation counters, timestamps, and opaque 32-byte descriptor lookup tokens.
-It never receives plaintext or encryption keys, and it never derives or
-interprets a lookup token.
+It has no decryption or key-derivation operations and never interprets a lookup
+token. Clients are responsible for encrypting data before uploading it.
 
 Descriptor lookup is deliberately unauthenticated: knowing a lookup token is
 the read capability for the records it points at. That read capability confers
@@ -65,6 +65,8 @@ association points at an existing record. Descriptor cursor identities and
 sorted associations are included in the aggregate digest. A syntactically
 valid token change needs comparison with a trusted baseline to be detected;
 the server cannot validate its relationship to the encrypted descriptor.
+Association reads stop at 17 rows, enough to reject more than the allowed 16
+without loading an unbounded set from an operator-supplied database copy.
 Backups may retain ciphertext deleted from the live database and must follow
 an explicit retention policy.
 
@@ -83,7 +85,7 @@ totals under the same rules.
 Logs must not contain per-request or per-user ciphertext, public keys,
 signatures, hashes, ETags, lookup tokens, digests of lookup tokens, source
 addresses, headers, request bodies, SQL values, or database paths. The `aggregate_sha256` printed to an operator's
-standard output by `backup` and `verify-backup` is a database-wide verification
+standard output by `verify-backup` is a database-wide verification
 digest, not a request log or per-user identifier, and is exempt for
 before-and-after verification.
 

@@ -996,9 +996,9 @@ impl Actor {
             .descriptor_bytes
             .checked_add(new_bytes)
             .ok_or(StorageError::InvalidData)?;
-        // Descriptor growth draws from the shared byte budget only. The
-        // new-head bucket stays reserved for wallet backup heads so that
-        // descriptor traffic can never block a wallet backup.
+        // Descriptor growth shares the byte budget with wallet backups. The
+        // separate head bucket limits wallet creation, but does not reserve
+        // bytes for it when descriptor publications exhaust shared capacity.
         let charge = AdmissionCharge {
             new_heads: 0,
             total_growth_bytes: new_bytes,
@@ -1189,7 +1189,9 @@ fn fetch_descriptor(
     raw.map(descriptor_from_raw).transpose()
 }
 
-/// The stored association set for one record, in ascending token order.
+/// The stored association set in ascending token order, with at most one row
+/// beyond the protocol limit so callers can reject an oversized set without
+/// loading unbounded associations from a damaged database.
 fn descriptor_tokens(
     connection: &Connection,
     publisher: &[u8; 32],
@@ -1199,7 +1201,7 @@ fn descriptor_tokens(
         .prepare(
             "SELECT token FROM descriptor_lookups
              WHERE publisher_pubkey = ?1 AND ciphertext_sha256 = ?2
-             ORDER BY token",
+             ORDER BY token LIMIT 17",
         )
         .map_err(|_| StorageError::Database)?;
     let rows = statement
@@ -3502,6 +3504,23 @@ mod tests {
                 params![token(16)],
             )
             .map_err(|_| "failed to add test lookup".to_owned())?;
+        assert!(verify_backup(&path).is_err());
+
+        // A hostile saved file can contain many more links. Read only enough
+        // to prove the count is invalid, not the entire association set.
+        for index in 17_u8..64 {
+            connection
+                .execute(
+                    "INSERT INTO descriptor_lookups (token, publisher_pubkey, ciphertext_sha256)
+                     SELECT ?1, publisher_pubkey, ciphertext_sha256 FROM descriptor_records",
+                    params![token(index)],
+                )
+                .map_err(|_| "failed to add excess test lookup".to_owned())?;
+        }
+        let hash: [u8; 32] = Sha256::digest([6; 16]).into();
+        let loaded = descriptor_tokens(&connection, &[2; 32], &hash)
+            .map_err(|_| "failed to read bounded test lookups".to_owned())?;
+        assert_eq!(loaded.len(), MAX_DESCRIPTOR_LOOKUP_TOKENS + 1);
         drop(connection);
         assert!(verify_backup(&path).is_err());
         fs::remove_dir_all(parent_of(&path)?).map_err(|_| "cleanup failed".to_owned())?;

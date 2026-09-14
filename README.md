@@ -22,6 +22,9 @@ tokens the client derives and the server never interprets:
 The descriptor resource is additive. It changes no wallet backup request
 format, response, or semantic.
 
+See [CHANGELOG.md](CHANGELOG.md) for the v0.4.0 release scope. The package
+version is independent of the API version; both resources use `/api/v1/`.
+
 ## Build
 
 ```sh
@@ -47,8 +50,11 @@ Four variables are required: `BACKUP_SERVER_DB_PATH`,
 ceilings, rate windows, admission budgets, concurrency, timeouts, descriptor
 record and lookup bounds, and log level — are enumerated with their
 development defaults in `src/config.rs`. Descriptor variables all carry
-`DESCRIPTOR` in their name and every one of them is optional, so an existing
-deployment starts unchanged.
+`DESCRIPTOR` in their name and every one of them is optional. Size the shared
+queue and growth budget for both resources: the queue must exceed the sum of
+all in-flight limits, and the growth bucket must admit the largest accepted
+metadata or descriptor ciphertext. Defaults do not make every earlier custom
+configuration valid; check the intended configuration before starting service.
 Production limits are set in the deployment environment and are not
 published. The Nginx files under `deploy/` are structural templates whose
 rates are likewise tuned privately before deployment.
@@ -69,10 +75,16 @@ persistent growth bucket. Deletes never refund these budgets. Admission
 checks and mutations commit in one SQLite transaction, so concurrent requests
 cannot overshoot a bucket.
 
-Descriptor records draw from the same persistent growth bucket, and
-deliberately not from the head bucket, so descriptor traffic cannot block
-wallet backup head creation. Their counts are additionally bounded per
-publisher and across the service.
+Descriptor records draw from the same persistent growth bucket, but not from
+the head bucket. Exhausting shared growth capacity can temporarily prevent
+metadata creation or growth as well as descriptor publication. Descriptor
+counts are additionally bounded per publisher and across the service.
+
+Each descriptor lookup page consumes one lookup-window request. Size the
+window for multi-page recovery and ordinary retries. Clients must honor
+`Retry-After` and retain a continuation cursor when interrupted; increasing
+limits is not a substitute for resumable recovery. The per-token-set window
+does not replace the proxy's per-source and global limits.
 
 ## Upgrade
 

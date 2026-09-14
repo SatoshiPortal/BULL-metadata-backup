@@ -177,9 +177,14 @@ others.
 | Repeat lookups of one token set per window | 60 per hour |
 
 Ciphertext growth draws from the same persistent growth budget wallet backups
-use. Descriptor records deliberately do **not** draw from the new-head
-budget, so descriptor traffic cannot block wallet backup head creation.
+use. Descriptor records do **not** draw from the new-head budget, but exhausting
+the shared byte budget can still block metadata creation or growth.
 Deployments set the real values in the environment; they are not published.
+
+Each page consumes one request from the lookup window. After a rate limit,
+honor `Retry-After` and resume with the same tokens and saved cursor. The
+token-set window is supplemental; per-source and global proxy limits remain
+necessary even when it is enabled.
 
 ## Errors
 

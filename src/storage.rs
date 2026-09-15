@@ -18,10 +18,16 @@ use crate::protocol::{
     ABSOLUTE_MAX_CIPHERTEXT_BYTES, ABSOLUTE_MAX_DESCRIPTOR_CIPHERTEXT_BYTES, BackupStream,
     MAX_DESCRIPTOR_LOOKUP_TOKENS, MIN_DESCRIPTOR_LOOKUP_TOKENS, compute_etag,
 };
+use crate::recovery_prototype::{self, FetchRequest, Page, Receipt, RecoveryPolicy, StoreRequest};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const SCHEMA_V1: &str = include_str!("../schema.sql");
 const SCHEMA_V2_MIGRATION: &str = include_str!("../schema-v2.sql");
+const SCHEMA_V3_MIGRATION: &str = include_str!("../schema-v3.sql");
+const RECOVERY_GRANTS_SCHEMA: &str = "CREATE TABLE recovery_grants(owner TEXT NOT NULL, grant_id TEXT NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(owner,grant_id))";
+const RECOVERY_RECORDS_SCHEMA: &str = "CREATE TABLE recovery_records(id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, grant_id TEXT NOT NULL, hash TEXT NOT NULL, ciphertext BLOB NOT NULL, grant_json TEXT NOT NULL, UNIQUE(owner,grant_id,hash))";
+const RECOVERY_OWNER_INDEX_SCHEMA: &str =
+    "CREATE INDEX recovery_owner_id ON recovery_records(owner,id)";
 const _: () = assert!(ABSOLUTE_MAX_DESCRIPTOR_CIPHERTEXT_BYTES == 65_536);
 const TABLE_SCHEMA: &str = "CREATE TABLE wallet_backup_heads (
     author_pubkey       BLOB    NOT NULL PRIMARY KEY,
@@ -203,6 +209,9 @@ pub struct VerifyReport {
     pub live_bytes: u64,
     pub descriptor_records: u64,
     pub descriptor_bytes: u64,
+    pub recovery_records: u64,
+    pub recovery_bytes: u64,
+    pub recovery_sha256: String,
     pub aggregate_sha256: String,
 }
 
@@ -223,6 +232,9 @@ pub struct DescriptorMetricsSnapshot {
     pub current_bytes: u64,
 }
 
+/// Recovery publications share storage capacity but have independent counters.
+pub type RecoveryMetricsSnapshot = DescriptorMetricsSnapshot;
+
 #[derive(Default)]
 struct StorageMetrics {
     new_heads_admitted: AtomicU64,
@@ -234,9 +246,29 @@ struct StorageMetrics {
     descriptor_record_bytes_admitted: AtomicU64,
     current_descriptor_records: AtomicU64,
     current_descriptor_bytes: AtomicU64,
+    recovery_records_admitted: AtomicU64,
+    recovery_record_bytes_admitted: AtomicU64,
+    current_recovery_records: AtomicU64,
+    current_recovery_bytes: AtomicU64,
 }
 
 enum Command {
+    ImportRecovery {
+        path: PathBuf,
+        policy: RecoveryPolicy,
+        reply: oneshot::Sender<Result<VerifyReport, StorageError>>,
+    },
+    StoreRecovery {
+        policy: RecoveryPolicy,
+        request: StoreRequest,
+        now: u64,
+        reply: oneshot::Sender<Result<Receipt, recovery_prototype::Error>>,
+    },
+    FetchRecovery {
+        request: FetchRequest,
+        now: u64,
+        reply: oneshot::Sender<Result<Page, recovery_prototype::Error>>,
+    },
     Fetch {
         author: [u8; 32],
         reply: oneshot::Sender<Result<Option<Head>, StorageError>>,
@@ -300,6 +332,8 @@ struct Actor {
     max_heads: u64,
     descriptor_records: u64,
     descriptor_bytes: u64,
+    recovery_bytes: u64,
+    recovery_records: u64,
     max_descriptor_records: u64,
     max_descriptor_records_per_publisher: u64,
     admission: AdmissionConfig,
@@ -323,6 +357,23 @@ struct AdmissionCharge {
 struct AliveGuard(Arc<AtomicBool>);
 
 impl StorageMetrics {
+    fn recovery_snapshot_and_reset(&self) -> RecoveryMetricsSnapshot {
+        RecoveryMetricsSnapshot {
+            records_admitted: self.recovery_records_admitted.swap(0, Ordering::Relaxed),
+            record_bytes_admitted: self
+                .recovery_record_bytes_admitted
+                .swap(0, Ordering::Relaxed),
+            current_records: self.current_recovery_records.load(Ordering::Relaxed),
+            current_bytes: self.current_recovery_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    fn set_current_recovery(&self, records: u64, bytes: u64) {
+        self.current_recovery_records
+            .store(records, Ordering::Relaxed);
+        self.current_recovery_bytes.store(bytes, Ordering::Relaxed);
+    }
+
     fn snapshot_and_reset(&self) -> StorageMetricsSnapshot {
         StorageMetricsSnapshot {
             new_heads_admitted: self.new_heads_admitted.swap(0, Ordering::Relaxed),
@@ -487,6 +538,57 @@ impl StorageOwner {
 }
 
 impl Storage {
+    pub fn recovery_metrics_snapshot(&self) -> RecoveryMetricsSnapshot {
+        self.metrics.recovery_snapshot_and_reset()
+    }
+
+    pub async fn import_recovery(
+        &self,
+        path: PathBuf,
+        policy: RecoveryPolicy,
+    ) -> Result<VerifyReport, CallError> {
+        let (reply, response) = oneshot::channel();
+        self.try_send(Command::ImportRecovery {
+            path,
+            policy,
+            reply,
+        })?;
+        response
+            .await
+            .map_err(|_| CallError::Unavailable)?
+            .map_err(map_storage_error)
+    }
+
+    pub async fn store_recovery(
+        &self,
+        policy: RecoveryPolicy,
+        request: StoreRequest,
+        now: u64,
+    ) -> Result<Result<Receipt, recovery_prototype::Error>, CallError> {
+        let (reply, response) = oneshot::channel();
+        self.try_send(Command::StoreRecovery {
+            policy,
+            request,
+            now,
+            reply,
+        })?;
+        response.await.map_err(|_| CallError::Unavailable)
+    }
+
+    pub async fn fetch_recovery(
+        &self,
+        request: FetchRequest,
+        now: u64,
+    ) -> Result<Result<Page, recovery_prototype::Error>, CallError> {
+        let (reply, response) = oneshot::channel();
+        self.try_send(Command::FetchRecovery {
+            request,
+            now,
+            reply,
+        })?;
+        response.await.map_err(|_| CallError::Unavailable)
+    }
+
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
     }
@@ -652,7 +754,7 @@ impl Actor {
         fs::set_permissions(&config.path, fs::Permissions::from_mode(0o600))
             .map_err(|error| format!("failed to set SQLite database permissions: {error}"))?;
         configure_connection(&connection, config.busy_timeout)?;
-        let fresh_database = initialize_schema(&connection)?;
+        let fresh_database = initialize_schema(&mut connection)?;
         verify_schema_objects(&connection)?;
         synchronize_admission(
             &mut connection,
@@ -665,10 +767,18 @@ impl Actor {
         metrics.set_current(heads, live_bytes);
         let (descriptor_records, descriptor_bytes) = reconstruct_descriptor_counters(&connection)?;
         metrics.set_current_descriptors(descriptor_records, descriptor_bytes);
-        if live_bytes > config.max_live_bytes || heads > config.max_heads {
+        let (recovery_records, recovery_bytes, _) = recovery_prototype::verify_rows(&connection)?;
+        recovery_sequence(&connection)?;
+        metrics.set_current_recovery(recovery_records, recovery_bytes);
+        let aggregate_bytes = live_bytes
+            .checked_add(descriptor_bytes)
+            .and_then(|bytes| bytes.checked_add(recovery_bytes));
+        if aggregate_bytes.is_none_or(|bytes| bytes > config.max_live_bytes)
+            || heads > config.max_heads
+        {
             tracing::warn!(
                 event = "configured_capacity_below_existing_state",
-                "configured capacity is below existing wallet backup state"
+                "configured capacity is below existing backup state"
             );
         }
         Ok(Self {
@@ -680,6 +790,8 @@ impl Actor {
             max_heads: config.max_heads,
             descriptor_records,
             descriptor_bytes,
+            recovery_bytes,
+            recovery_records,
             max_descriptor_records: config.max_descriptor_records,
             max_descriptor_records_per_publisher: config.max_descriptor_records_per_publisher,
             admission: config.admission,
@@ -687,9 +799,39 @@ impl Actor {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn run(&mut self, mut receiver: mpsc::Receiver<Command>) {
         while let Some(command) = receiver.blocking_recv() {
             match command {
+                Command::ImportRecovery {
+                    path,
+                    policy,
+                    reply,
+                } => {
+                    let result = self
+                        .import_recovery(&path, &policy)
+                        .map_err(|_| StorageError::InvalidData);
+                    send_response(reply, result);
+                }
+                Command::StoreRecovery {
+                    policy,
+                    request,
+                    now,
+                    reply,
+                } => {
+                    let result = self.store_recovery(&policy, &request, now);
+                    send_response(reply, result);
+                }
+                Command::FetchRecovery {
+                    request,
+                    now,
+                    reply,
+                } => {
+                    send_response(
+                        reply,
+                        recovery_prototype::fetch_on_connection(&self.connection, &request, now),
+                    );
+                }
                 Command::Fetch { author, reply } => {
                     send_response(reply, fetch_head(&self.connection, &author));
                 }
@@ -843,7 +985,11 @@ impl Actor {
             .checked_sub(previous)
             .and_then(|value| value.checked_add(new_bytes))
             .ok_or(StorageError::InvalidData)?;
-        if projected > self.max_live_bytes {
+        if projected
+            .checked_add(self.descriptor_bytes)
+            .and_then(|bytes| bytes.checked_add(self.recovery_bytes))
+            .is_none_or(|bytes| bytes > self.max_live_bytes)
+        {
             return Ok(MutationOutcome::CapacityExceeded);
         }
         let new_head = current.is_none();
@@ -996,6 +1142,13 @@ impl Actor {
             .descriptor_bytes
             .checked_add(new_bytes)
             .ok_or(StorageError::InvalidData)?;
+        if projected_bytes
+            .checked_add(self.live_bytes)
+            .and_then(|bytes| bytes.checked_add(self.recovery_bytes))
+            .is_none_or(|bytes| bytes > self.max_live_bytes)
+        {
+            return Ok(DescriptorStoreOutcome::CapacityExceeded);
+        }
         // Descriptor growth shares the byte budget with wallet backups. The
         // separate head bucket limits wallet creation, but does not reserve
         // bytes for it when descriptor publications exhaust shared capacity.
@@ -1041,6 +1194,228 @@ impl Actor {
             self.descriptor_bytes,
         );
         Ok(DescriptorStoreOutcome::Created { created_at: now })
+    }
+
+    fn store_recovery(
+        &mut self,
+        policy: &RecoveryPolicy,
+        request: &StoreRequest,
+        now: u64,
+    ) -> Result<Receipt, recovery_prototype::Error> {
+        use axum::http::StatusCode;
+        let database_error = |_| recovery_prototype::Error(StatusCode::INTERNAL_SERVER_ERROR);
+        let occupied = self
+            .live_bytes
+            .checked_add(self.descriptor_bytes)
+            .and_then(|bytes| bytes.checked_add(self.recovery_bytes))
+            .ok_or(recovery_prototype::Error(StatusCode::INTERNAL_SERVER_ERROR))?;
+        let available = self.max_live_bytes.saturating_sub(occupied);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        let before = transaction.total_changes();
+        let receipt = recovery_prototype::store_in_transaction(
+            &transaction,
+            policy,
+            request,
+            now,
+            available,
+        )?;
+        // The SQL helper performs no writes for an exact retry. A new record
+        // and its admission charge must commit together, including its grant.
+        let created = transaction.total_changes() != before;
+        let projected = if created {
+            self.recovery_bytes
+                .checked_add(request.ciphertext_bytes)
+                .ok_or(recovery_prototype::Error(StatusCode::INTERNAL_SERVER_ERROR))?
+        } else {
+            self.recovery_bytes
+        };
+        if created
+            && !consume_admission(
+                &transaction,
+                &self.admission,
+                AdmissionCharge {
+                    new_heads: 0,
+                    total_growth_bytes: request.ciphertext_bytes,
+                },
+                now,
+            )
+            .map_err(|_| recovery_prototype::Error(StatusCode::INTERNAL_SERVER_ERROR))?
+        {
+            // Roll back both record/grant insertion and admission updates.
+            return Err(recovery_prototype::Error(StatusCode::TOO_MANY_REQUESTS));
+        }
+        let projected_records = self
+            .recovery_records
+            .checked_add(u64::from(created))
+            .ok_or(recovery_prototype::Error(StatusCode::INTERNAL_SERVER_ERROR))?;
+        transaction.commit().map_err(database_error)?;
+        self.recovery_bytes = projected;
+        self.recovery_records = projected_records;
+        if created {
+            saturating_add(&self.metrics.recovery_records_admitted, 1);
+            saturating_add(
+                &self.metrics.recovery_record_bytes_admitted,
+                request.ciphertext_bytes,
+            );
+        }
+        self.metrics
+            .set_current_recovery(self.recovery_records, self.recovery_bytes);
+        Ok(receipt)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn import_recovery(
+        &mut self,
+        path: &Path,
+        policy: &RecoveryPolicy,
+    ) -> Result<VerifyReport, String> {
+        policy.validate()?;
+        reject_symlink(path)?;
+        // A legacy server owns this lock while serving. A read-only copy has
+        // no lock, but if one exists we must prove it is not currently owned.
+        let mut source_lock_path = path.as_os_str().to_os_string();
+        source_lock_path.push(".lock");
+        let source_lock_path = PathBuf::from(source_lock_path);
+        reject_symlink(&source_lock_path)?;
+        let _source_lock = match File::open(&source_lock_path) {
+            Ok(lock) => {
+                fs2::FileExt::try_lock_shared(&lock)
+                    .map_err(|_| "source recovery database is still serving".to_owned())?;
+                Some(lock)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err("cannot inspect source recovery lock".to_owned()),
+        };
+        let mut source = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|_| "cannot open recovery source read-only".to_owned())?;
+        source
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(|error| error.to_string())?;
+        source
+            .execute_batch("PRAGMA trusted_schema=OFF; PRAGMA query_only=ON;")
+            .map_err(|error| error.to_string())?;
+        let source = source.transaction().map_err(|error| error.to_string())?;
+        verify_legacy_recovery_schema(&source)?;
+        let integrity: String = source
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if integrity != "ok" {
+            return Err("source integrity check failed".to_owned());
+        }
+        let (records, bytes, _) = recovery_prototype::verify_rows(&source)?;
+        let foreign: bool = source.query_row(
+            "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE json_extract(grant_json,'$.origin')<>?1 OR json_extract(grant_json,'$.publisher')<>?2)",
+            params![policy.origin, policy.publisher], |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if foreign {
+            return Err(
+                "source recovery publisher or origin differs from configured policy".to_owned(),
+            );
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let before = verify_connection(&transaction)?;
+        if before.recovery_records == records && recovery_records_identical(&source, &transaction)?
+        {
+            return Ok(before);
+        }
+        if before.recovery_records != 0 || recovery_sequence(&transaction)?.is_some() {
+            return Err(
+                "target recovery records are not pristine or identical to source".to_owned(),
+            );
+        }
+        let occupied = before
+            .live_bytes
+            .checked_add(before.descriptor_bytes)
+            .and_then(|value| value.checked_add(bytes))
+            .ok_or_else(|| "aggregate byte count overflow".to_owned())?;
+        if occupied > self.max_live_bytes
+            || records > policy.max_records
+            || bytes > policy.max_bytes
+        {
+            return Err("recovery import exceeds configured capacity".to_owned());
+        }
+        if !consume_admission(
+            &transaction,
+            &self.admission,
+            AdmissionCharge {
+                new_heads: 0,
+                total_growth_bytes: bytes,
+            },
+            system_time_secs()?,
+        )
+        .map_err(|_| "cannot read recovery import admission".to_owned())?
+        {
+            return Err("recovery import exceeds growth admission".to_owned());
+        }
+        {
+            let mut query = source
+                .prepare(
+                    "SELECT owner,grant_id,digest FROM recovery_grants ORDER BY owner,grant_id",
+                )
+                .map_err(|error| error.to_string())?;
+            let mut rows = query.query([]).map_err(|error| error.to_string())?;
+            while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+                let owner: String = row.get(0).map_err(|error| error.to_string())?;
+                let grant_id: String = row.get(1).map_err(|error| error.to_string())?;
+                let digest: String = row.get(2).map_err(|error| error.to_string())?;
+                transaction
+                    .execute(
+                        "INSERT INTO recovery_grants(owner,grant_id,digest) VALUES (?1,?2,?3)",
+                        params![owner, grant_id, digest],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        {
+            let mut query = source.prepare("SELECT id,owner,grant_id,hash,ciphertext,grant_json FROM recovery_records ORDER BY id")
+                .map_err(|error| error.to_string())?;
+            let mut rows = query.query([]).map_err(|error| error.to_string())?;
+            while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+                let (id, owner, grant_id, hash, ciphertext, grant_json) = recovery_import_row(row)?;
+                transaction.execute("INSERT INTO recovery_records(id,owner,grant_id,hash,ciphertext,grant_json) VALUES (?1,?2,?3,?4,?5,?6)",
+                    params![id,owner,grant_id,hash,ciphertext,grant_json]).map_err(|error| error.to_string())?;
+            }
+        }
+        // Preserve the source cursor high-water mark, even if an old copy has
+        // gaps. Never make a previously issued record ID available again.
+        if let Some(sequence) = recovery_sequence(&source)? {
+            transaction
+                .execute(
+                    "DELETE FROM sqlite_sequence WHERE name='recovery_records'",
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "INSERT INTO sqlite_sequence(name,seq) VALUES ('recovery_records',?1)",
+                    [sequence],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        let report = verify_connection(&transaction)?;
+        if report.recovery_records != records
+            || report.recovery_bytes != bytes
+            || !recovery_records_identical(&source, &transaction)?
+        {
+            return Err("recovery import verification differs from source".to_owned());
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        self.recovery_records = report.recovery_records;
+        self.recovery_bytes = report.recovery_bytes;
+        saturating_add(&self.metrics.recovery_records_admitted, records);
+        saturating_add(&self.metrics.recovery_record_bytes_admitted, bytes);
+        self.metrics
+            .set_current_recovery(self.recovery_records, self.recovery_bytes);
+        Ok(report)
     }
 
     fn cleanup(&mut self, cutoff: i64, batch_size: u64) -> Result<u64, StorageError> {
@@ -1414,7 +1789,7 @@ fn configure_connection(connection: &Connection, busy_timeout: Duration) -> Resu
 /// same version 2 migration an existing deployment runs, so the two paths
 /// cannot diverge. The migration only adds descriptor objects; it never reads
 /// or writes `wallet_backup_heads`.
-fn initialize_schema(connection: &Connection) -> Result<bool, String> {
+fn initialize_schema(connection: &mut Connection) -> Result<bool, String> {
     let mut version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|_| "failed to read SQLite schema version".to_owned())?;
@@ -1448,6 +1823,22 @@ fn initialize_schema(connection: &Connection) -> Result<bool, String> {
                 "SQLite schema upgraded"
             );
         }
+    }
+    if version == 2 {
+        // Validate the source schema before changing it. Adoption, exact schema
+        // verification and the version update all succeed or roll back together.
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| "failed to begin version 3 migration".to_owned())?;
+        verify_schema_objects_at_version(&transaction, 2)?;
+        transaction
+            .execute_batch(SCHEMA_V3_MIGRATION)
+            .map_err(|_| "failed to upgrade SQLite schema to version 3".to_owned())?;
+        verify_schema_objects(&transaction)?;
+        transaction
+            .commit()
+            .map_err(|_| "failed to commit version 3 migration".to_owned())?;
+        version = read_schema_version(connection)?;
     }
     if version != SCHEMA_VERSION {
         return Err("unsupported SQLite schema version".to_owned());
@@ -1837,11 +2228,27 @@ fn verify_connection(connection: &Connection) -> Result<VerifyReport, String> {
     }
     let (descriptor_records, descriptor_bytes) =
         verify_descriptor_rows(connection, &mut aggregate)?;
+    let (recovery_records, recovery_bytes, recovery_sha256) =
+        recovery_prototype::verify_rows(connection)?;
+    aggregate.update(b"arkade-recovery-v1\0");
+    aggregate.update(recovery_records.to_be_bytes());
+    aggregate.update(recovery_bytes.to_be_bytes());
+    aggregate.update(recovery_sha256.as_bytes());
+    match recovery_sequence(connection)? {
+        Some(sequence) => {
+            aggregate.update([1]);
+            aggregate.update(sequence.to_be_bytes());
+        }
+        None => aggregate.update([0]),
+    }
     Ok(VerifyReport {
         heads,
         live_bytes,
         descriptor_records,
         descriptor_bytes,
+        recovery_records,
+        recovery_bytes,
+        recovery_sha256,
         aggregate_sha256: hex::encode(aggregate.finalize()),
     })
 }
@@ -1946,9 +2353,118 @@ fn verify_schema(connection: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+fn verify_legacy_recovery_schema(connection: &Connection) -> Result<(), String> {
+    if read_schema_version(connection)? != 0 {
+        return Err("source is not an unversioned standalone recovery database".to_owned());
+    }
+    verify_recovery_schema_objects(connection)?;
+    let objects: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if objects != 3 {
+        return Err("source contains unexpected schema objects".to_owned());
+    }
+    recovery_sequence(connection)?;
+    Ok(())
+}
+
+fn verify_recovery_schema_objects(connection: &Connection) -> Result<(), String> {
+    for (kind, name, expected) in [
+        ("table", "recovery_grants", RECOVERY_GRANTS_SCHEMA),
+        ("table", "recovery_records", RECOVERY_RECORDS_SCHEMA),
+        ("index", "recovery_owner_id", RECOVERY_OWNER_INDEX_SCHEMA),
+    ] {
+        let sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = ?1 AND name = ?2",
+                params![kind, name],
+                |row| row.get(0),
+            )
+            .map_err(|_| format!("{name} is missing"))?;
+        if sql != expected {
+            return Err(format!("{name} does not match version 3"));
+        }
+    }
+    Ok(())
+}
+
+type RecoveryImportRow = (i64, String, String, String, Vec<u8>, String);
+
+fn recovery_import_row(row: &rusqlite::Row<'_>) -> Result<RecoveryImportRow, String> {
+    Ok((
+        row.get(0).map_err(|error| error.to_string())?,
+        row.get(1).map_err(|error| error.to_string())?,
+        row.get(2).map_err(|error| error.to_string())?,
+        row.get(3).map_err(|error| error.to_string())?,
+        row.get(4).map_err(|error| error.to_string())?,
+        row.get(5).map_err(|error| error.to_string())?,
+    ))
+}
+
+fn recovery_sequence(connection: &Connection) -> Result<Option<i64>, String> {
+    let sequences = connection
+        .prepare("SELECT seq FROM sqlite_sequence WHERE name='recovery_records' LIMIT 2")
+        .map_err(|error| error.to_string())?
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let maximum: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(id),0) FROM recovery_records",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    match sequences.as_slice() {
+        [] if maximum == 0 => Ok(None),
+        [sequence] if *sequence >= maximum && *sequence >= 0 => Ok(Some(*sequence)),
+        _ => Err("recovery cursor sequence is inconsistent".to_owned()),
+    }
+}
+
+fn recovery_records_identical(source: &Connection, target: &Connection) -> Result<bool, String> {
+    if recovery_sequence(source)? != recovery_sequence(target)? {
+        return Ok(false);
+    }
+    let mut source_query = source
+        .prepare(
+            "SELECT id,owner,grant_id,hash,ciphertext,grant_json FROM recovery_records ORDER BY id",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut target_query = target
+        .prepare(
+            "SELECT id,owner,grant_id,hash,ciphertext,grant_json FROM recovery_records ORDER BY id",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut source_rows = source_query.query([]).map_err(|error| error.to_string())?;
+    let mut target_rows = target_query.query([]).map_err(|error| error.to_string())?;
+    loop {
+        let source_row = source_rows.next().map_err(|error| error.to_string())?;
+        let target_row = target_rows.next().map_err(|error| error.to_string())?;
+        match (source_row, target_row) {
+            (None, None) => return Ok(true),
+            (Some(left), Some(right))
+                if recovery_import_row(left)? == recovery_import_row(right)? => {}
+            _ => return Ok(false),
+        }
+    }
+}
+
 fn verify_schema_objects(connection: &Connection) -> Result<(), String> {
+    verify_schema_objects_at_version(connection, SCHEMA_VERSION)
+}
+
+fn verify_schema_objects_at_version(
+    connection: &Connection,
+    expected_version: i64,
+) -> Result<(), String> {
     let version = read_schema_version(connection)?;
-    if version != SCHEMA_VERSION {
+    if version != expected_version {
         return Err("unsupported SQLite schema version".to_owned());
     }
     let table_sql: String = connection
@@ -2014,6 +2530,9 @@ fn verify_schema_objects(connection: &Connection) -> Result<(), String> {
             return Err(format!("{mismatch} does not match version 2"));
         }
     }
+    if version == 3 {
+        verify_recovery_schema_objects(connection)?;
+    }
     let user_objects: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM sqlite_schema
@@ -2022,7 +2541,7 @@ fn verify_schema_objects(connection: &Connection) -> Result<(), String> {
             |row| row.get(0),
         )
         .map_err(|_| "failed to count SQLite schema objects".to_owned())?;
-    if user_objects != 6 {
+    if user_objects != if version == 3 { 9 } else { 6 } {
         return Err("SQLite contains an unexpected schema object".to_owned());
     }
     Ok(())
@@ -3771,6 +4290,648 @@ mod tests {
         assert!(StorageOwner::start(config(path.clone())).is_err());
         assert!(verify_backup(&path).is_err());
         fs::remove_dir_all(parent_of(&path)?).map_err(|_| "cleanup failed".to_owned())?;
+        Ok(())
+    }
+
+    fn recovery_config(path: PathBuf) -> StorageConfig {
+        let mut settings = config(path);
+        // Import and schema adoption use wall-clock time; keep fixture
+        // admission deterministic if a test crosses a one-second boundary.
+        settings.admission.new_heads.refill = 1;
+        settings.admission.new_heads.refill_interval = Duration::from_secs(86_400);
+        settings.admission.total_growth_bytes.refill = 1;
+        settings.admission.total_growth_bytes.refill_interval = Duration::from_secs(86_400);
+        settings
+    }
+
+    fn recovery_fixture(value: u8, bytes: usize) -> Result<(RecoveryPolicy, StoreRequest), String> {
+        use crate::recovery_prototype::{Grant, grant_digest, store_digest};
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let owner = recovery_pair(1)?;
+        let publisher = recovery_pair(2)?;
+        let policy = RecoveryPolicy {
+            origin: "http://127.0.0.1:9000".to_owned(),
+            publisher: publisher.x_only_public_key().0.to_string(),
+            max_records: 100,
+            max_bytes: 1 << 20,
+        };
+        let mut grant = Grant {
+            owner: owner.x_only_public_key().0.to_string(),
+            publisher: policy.publisher.clone(),
+            origin: policy.origin.clone(),
+            id: hex::encode([value; 32]),
+            scope: hex::encode([42; 32]),
+            valid_from: 90,
+            expires_at: 110,
+            max_records: 16,
+            max_bytes: 1024,
+            signature: String::new(),
+        };
+        grant.signature = recovery_sign(&owner, &grant_digest(&grant));
+        let ciphertext = vec![value; bytes];
+        let mut request = StoreRequest {
+            grant,
+            ciphertext: STANDARD.encode(&ciphertext),
+            ciphertext_sha256: hex::encode(Sha256::digest(&ciphertext)),
+            ciphertext_bytes: u64::try_from(bytes).map_err(|error| error.to_string())?,
+            timestamp: 100,
+            signature: String::new(),
+        };
+        request.signature = recovery_sign(&publisher, &store_digest(&request));
+        Ok((policy, request))
+    }
+
+    fn recovery_pair(value: u8) -> Result<secp256k1::Keypair, String> {
+        let secret = secp256k1::SecretKey::from_byte_array([value; 32])
+            .map_err(|error| error.to_string())?;
+        Ok(secp256k1::Keypair::from_secret_key(
+            &secp256k1::Secp256k1::new(),
+            &secret,
+        ))
+    }
+
+    fn recovery_sign(pair: &secp256k1::Keypair, digest: &[u8; 32]) -> String {
+        secp256k1::Secp256k1::new()
+            .sign_schnorr_no_aux_rand(digest, pair)
+            .to_string()
+    }
+
+    fn recovery_fetch(clock: u64) -> Result<FetchRequest, String> {
+        let pair = recovery_pair(1)?;
+        let mut request = FetchRequest {
+            owner: pair.x_only_public_key().0.to_string(),
+            after: 0,
+            snapshot: 0,
+            timestamp: clock,
+            signature: String::new(),
+        };
+        request.signature = recovery_sign(&pair, &recovery_prototype::fetch_digest(&request));
+        Ok(request)
+    }
+
+    async fn store_recovery_fixture(
+        storage: &Storage,
+        policy: RecoveryPolicy,
+        request: StoreRequest,
+    ) -> Result<Result<Receipt, recovery_prototype::Error>, String> {
+        storage
+            .store_recovery(policy, request, 100)
+            .await
+            .map_err(|error| format!("recovery actor unavailable: {error:?}"))
+    }
+
+    async fn recovery_wallet(
+        storage: &Storage,
+        bytes: usize,
+        generation: i64,
+        expected: Option<[u8; 32]>,
+    ) -> Result<MutationOutcome, String> {
+        let author = [8; 32];
+        let npub = hex::encode(author);
+        let ciphertext = vec![8; bytes];
+        let hash: [u8; 32] = Sha256::digest(&ciphertext).into();
+        let etag = compute_etag(
+            BackupStream::WalletBackup,
+            &npub,
+            u64::try_from(generation).map_err(|error| error.to_string())?,
+            Some(&hex::encode(hash)),
+        );
+        storage
+            .store(
+                npub, author, generation, expected, etag, ciphertext, hash, 100,
+            )
+            .await
+            .map_err(|error| format!("wallet store failed: {error:?}"))
+    }
+
+    #[tokio::test]
+    async fn recovery_upgrade_preserves_version_two_heads_descriptors_and_admission()
+    -> Result<(), String> {
+        let path = test_path("recovery-migration")?;
+        let owner = StorageOwner::start(recovery_config(path.clone()))?;
+        let storage = owner.client();
+        assert_eq!(
+            recovery_wallet(&storage, 4, 1, None).await?,
+            MutationOutcome::Applied
+        );
+        assert!(matches!(
+            seed_descriptor(&storage, [3; 32], &[3; 4], &[token(3)], 100).await?,
+            DescriptorStoreOutcome::Created { .. }
+        ));
+        let head = storage
+            .fetch([8; 32])
+            .await
+            .map_err(|error| format!("fetch: {error:?}"))?;
+        owner.shutdown().await?;
+        let before = verify_backup(&path)?;
+        let tokens_before = admission_tokens(&path)?;
+        {
+            let connection = Connection::open(&path).map_err(|error| error.to_string())?;
+            connection.execute_batch("DROP TABLE recovery_records; DROP TABLE recovery_grants; PRAGMA user_version = 2;")
+                .map_err(|error| error.to_string())?;
+        }
+        let owner = StorageOwner::start(recovery_config(path.clone()))?;
+        assert_eq!(
+            head,
+            owner
+                .client()
+                .fetch([8; 32])
+                .await
+                .map_err(|error| format!("fetch: {error:?}"))?
+        );
+        owner.shutdown().await?;
+        assert_eq!(before, verify_backup(&path)?);
+        assert_eq!(tokens_before, admission_tokens(&path)?);
+        let connection = Connection::open(&path).map_err(|error| error.to_string())?;
+        assert_eq!(read_schema_version(&connection)?, 3);
+        drop(connection);
+        // Reopening version 3 changes neither rows nor the verification commitment.
+        let owner = StorageOwner::start(recovery_config(path.clone()))?;
+        owner.shutdown().await?;
+        assert_eq!(before, verify_backup(&path)?);
+        fs::remove_dir_all(parent_of(&path)?).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_migration_rejects_foreign_schema_without_partial_adoption()
+    -> Result<(), String> {
+        let path = test_path("recovery-migration-rollback")?;
+        let owner = StorageOwner::start(recovery_config(path.clone()))?;
+        assert_eq!(
+            recovery_wallet(&owner.client(), 4, 1, None).await?,
+            MutationOutcome::Applied
+        );
+        owner.shutdown().await?;
+        let connection = Connection::open(&path).map_err(|error| error.to_string())?;
+        connection.execute_batch("DROP TABLE recovery_records; DROP TABLE recovery_grants; PRAGMA user_version = 2; CREATE TABLE foreign_records (value TEXT);")
+            .map_err(|error| error.to_string())?;
+        assert!(StorageOwner::start(recovery_config(path.clone())).is_err());
+        assert_eq!(read_schema_version(&connection)?, 2);
+        let tables: i64 = connection.query_row("SELECT count(*) FROM sqlite_schema WHERE name IN ('recovery_records','recovery_grants')", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        assert_eq!(tables, 0);
+        assert_eq!(reconstruct_counters(&connection)?, (1, 4));
+        drop(connection);
+        fs::remove_dir_all(parent_of(&path)?).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn recovery_and_existing_streams_share_capacity_without_breaking_retries()
+    -> Result<(), String> {
+        use axum::http::StatusCode;
+        let path = test_path("recovery-shared-capacity")?;
+        let mut settings = recovery_config(path.clone());
+        settings.max_live_bytes = 14;
+        let owner = StorageOwner::start(settings.clone())?;
+        let storage = owner.client();
+        assert_eq!(
+            recovery_wallet(&storage, 4, 1, None).await?,
+            MutationOutcome::Applied
+        );
+        assert!(matches!(
+            seed_descriptor(&storage, [3; 32], &[3; 4], &[token(3)], 100).await?,
+            DescriptorStoreOutcome::Created { .. }
+        ));
+        let (policy, request) = recovery_fixture(1, 6)?;
+        let receipt = store_recovery_fixture(&storage, policy.clone(), request.clone())
+            .await?
+            .map_err(|error| format!("initial recovery: {error:?}"))?;
+        let tokens_before = admission_tokens(&path)?;
+        let retry = store_recovery_fixture(&storage, policy.clone(), request.clone())
+            .await?
+            .map_err(|error| format!("retry: {error:?}"))?;
+        assert_eq!(receipt.id, retry.id);
+        assert_eq!(tokens_before, admission_tokens(&path)?);
+        let (next_policy, next_request) = recovery_fixture(2, 1)?;
+        let error = store_recovery_fixture(&storage, next_policy, next_request)
+            .await?
+            .err()
+            .ok_or_else(|| "over-capacity recovery accepted".to_owned())?;
+        assert_eq!(error.0, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(
+            seed_descriptor(&storage, [4; 32], &[4; 1], &[token(4)], 100).await?,
+            DescriptorStoreOutcome::CapacityExceeded
+        );
+        assert!(matches!(
+            seed_descriptor(&storage, [3; 32], &[3; 4], &[token(3)], 100).await?,
+            DescriptorStoreOutcome::ExactRetry { .. }
+        ));
+        assert_eq!(
+            recovery_wallet(&storage, 4, 1, None).await?,
+            MutationOutcome::ExactRetry
+        );
+        let hash: [u8; 32] = Sha256::digest([8; 4]).into();
+        let previous_etag = compute_etag(
+            BackupStream::WalletBackup,
+            &hex::encode([8; 32]),
+            1,
+            Some(&hex::encode(hash)),
+        );
+        assert_eq!(
+            recovery_wallet(&storage, 5, 2, Some(previous_etag)).await?,
+            MutationOutcome::CapacityExceeded
+        );
+        owner.shutdown().await?;
+        let report = verify_backup(&path)?;
+        assert_eq!(
+            (
+                report.live_bytes,
+                report.descriptor_bytes,
+                report.recovery_records,
+                report.recovery_bytes
+            ),
+            (4, 4, 1, 6)
+        );
+        // A reduced cap and expired grant still permit existing records to be read/retried.
+        settings.max_live_bytes = 10;
+        let owner = StorageOwner::start(settings)?;
+        let storage = owner.client();
+        let mut retry = request;
+        retry.timestamp = 111;
+        retry.signature = recovery_sign(
+            &recovery_pair(2)?,
+            &recovery_prototype::store_digest(&retry),
+        );
+        let retried = storage
+            .store_recovery(policy, retry, 111)
+            .await
+            .map_err(|error| format!("retry: {error:?}"))?
+            .map_err(|error| format!("expired exact retry: {error:?}"))?;
+        assert_eq!(receipt.id, retried.id);
+        let page = storage
+            .fetch_recovery(recovery_fetch(111)?, 111)
+            .await
+            .map_err(|error| format!("fetch: {error:?}"))?
+            .map_err(|error| format!("expired fetch: {error:?}"))?;
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(
+            recovery_wallet(&storage, 5, 2, Some(previous_etag)).await?,
+            MutationOutcome::CapacityExceeded
+        );
+        owner.shutdown().await?;
+        assert_eq!(report, verify_backup(&path)?);
+        fs::remove_dir_all(parent_of(&path)?).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_admission_failure_rolls_back_record_grant_and_retry_charge()
+    -> Result<(), String> {
+        use axum::http::StatusCode;
+        let path = test_path("recovery-admission-rollback")?;
+        let mut settings = recovery_config(path.clone());
+        settings.admission.total_growth_bytes.capacity = 6;
+        let owner = StorageOwner::start(settings)?;
+        let storage = owner.client();
+        let (policy, request) = recovery_fixture(1, 6)?;
+        store_recovery_fixture(&storage, policy.clone(), request.clone())
+            .await?
+            .map_err(|error| format!("initial store: {error:?}"))?;
+        let before = admission_tokens(&path)?;
+        assert_eq!(before[1], 0);
+        for _ in 0..3 {
+            let (next_policy, next_request) = recovery_fixture(2, 1)?;
+            let error = store_recovery_fixture(&storage, next_policy, next_request)
+                .await?
+                .err()
+                .ok_or_else(|| "exhausted admission accepted".to_owned())?;
+            assert_eq!(error.0, StatusCode::TOO_MANY_REQUESTS);
+        }
+        store_recovery_fixture(&storage, policy, request)
+            .await?
+            .map_err(|error| format!("zero-budget exact retry: {error:?}"))?;
+        assert_eq!(before, admission_tokens(&path)?);
+        owner.shutdown().await?;
+        let connection = Connection::open(&path).map_err(|error| error.to_string())?;
+        let grants: i64 = connection
+            .query_row("SELECT count(*) FROM recovery_grants", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        assert_eq!(grants, 1);
+        drop(connection);
+        let report = verify_backup(&path)?;
+        assert_eq!((report.recovery_records, report.recovery_bytes), (1, 6));
+        fs::remove_dir_all(parent_of(&path)?).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_offline_copy_fetches_and_verification_detects_corruption()
+    -> Result<(), String> {
+        let path = test_path("recovery-offline-copy")?;
+        let owner = StorageOwner::start(recovery_config(path.clone()))?;
+        let (policy, request) = recovery_fixture(1, 6)?;
+        store_recovery_fixture(&owner.client(), policy, request)
+            .await?
+            .map_err(|error| format!("initial store: {error:?}"))?;
+        owner.shutdown().await?;
+        let baseline = verify_backup(&path)?;
+        let copy = parent_of(&path)?.join("offline.sqlite3");
+        fs::copy(&path, &copy).map_err(|error| error.to_string())?;
+        assert_eq!(baseline, verify_backup(&copy)?);
+        let owner = StorageOwner::start(recovery_config(copy.clone()))?;
+        let page = owner
+            .client()
+            .fetch_recovery(recovery_fetch(100)?, 100)
+            .await
+            .map_err(|error| format!("actor fetch: {error:?}"))?
+            .map_err(|error| format!("restored fetch: {error:?}"))?;
+        assert_eq!(page.records.len(), 1);
+        owner.shutdown().await?;
+        for sql in [
+            "UPDATE recovery_records SET ciphertext = zeroblob(6)",
+            "UPDATE recovery_grants SET digest = 'invalid'",
+            "DELETE FROM recovery_grants",
+            "INSERT INTO recovery_grants VALUES ('orphan','orphan','invalid')",
+            "UPDATE recovery_records SET grant_json = '{}'",
+            "DROP INDEX recovery_owner_id",
+            "UPDATE sqlite_sequence SET seq=0 WHERE name='recovery_records'",
+        ] {
+            fs::copy(&path, &copy).map_err(|error| error.to_string())?;
+            let connection = Connection::open(&copy).map_err(|error| error.to_string())?;
+            connection
+                .execute_batch(sql)
+                .map_err(|error| error.to_string())?;
+            drop(connection);
+            assert!(verify_backup(&copy).is_err(), "corruption accepted: {sql}");
+            assert!(
+                StorageOwner::start(recovery_config(copy.clone())).is_err(),
+                "corrupt startup accepted: {sql}"
+            );
+        }
+        // Losing a complete grant/record pair remains structurally valid, but changes the commitment.
+        fs::copy(&path, &copy).map_err(|error| error.to_string())?;
+        let connection = Connection::open(&copy).map_err(|error| error.to_string())?;
+        connection
+            .execute_batch("DELETE FROM recovery_records; DELETE FROM recovery_grants;")
+            .map_err(|error| error.to_string())?;
+        drop(connection);
+        let missing = verify_backup(&copy)?;
+        assert_ne!(baseline.recovery_sha256, missing.recovery_sha256);
+        assert_ne!(baseline.aggregate_sha256, missing.aggregate_sha256);
+        assert_eq!(
+            (baseline.heads, baseline.descriptor_records),
+            (missing.heads, missing.descriptor_records)
+        );
+        fs::remove_dir_all(parent_of(&path)?).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn legacy_recovery_source(path: &Path) -> Result<RecoveryPolicy, String> {
+        let mut connection = Connection::open(path).map_err(|error| error.to_string())?;
+        connection
+            .execute_batch(&format!(
+                "{RECOVERY_GRANTS_SCHEMA};{RECOVERY_RECORDS_SCHEMA};{RECOVERY_OWNER_INDEX_SCHEMA};"
+            ))
+            .map_err(|error| error.to_string())?;
+        let (policy, first) = recovery_fixture(1, 6)?;
+        recovery_prototype::store_on_connection(&mut connection, &policy, &first, 100, u64::MAX)
+            .map_err(|error| format!("legacy seed: {error:?}"))?;
+        let (_, second) = recovery_fixture(2, 6)?;
+        recovery_prototype::store_on_connection(&mut connection, &policy, &second, 100, u64::MAX)
+            .map_err(|error| format!("legacy seed: {error:?}"))?;
+        connection.execute_batch("UPDATE recovery_records SET id=id*7; UPDATE sqlite_sequence SET seq=20 WHERE name='recovery_records';")
+            .map_err(|error| error.to_string())?;
+        recovery_prototype::verify_rows(&connection)?;
+        Ok(policy)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn recovery_import_preserves_historical_ids_wallets_admission_and_exact_retry()
+    -> Result<(), String> {
+        let path = test_path("recovery-import")?;
+        let source = parent_of(&path)?.join("legacy.sqlite3");
+        let policy = legacy_recovery_source(&source)?;
+        let original = fs::read(&source).map_err(|error| error.to_string())?;
+        let mut settings = recovery_config(path.clone());
+        let owner = StorageOwner::start(settings.clone())?;
+        let storage = owner.client();
+        assert_eq!(
+            recovery_wallet(&storage, 4, 1, None).await?,
+            MutationOutcome::Applied
+        );
+        assert!(matches!(
+            seed_descriptor(&storage, [3; 32], &[3; 4], &[token(3)], 100).await?,
+            DescriptorStoreOutcome::Created { .. }
+        ));
+        let tokens_before = admission_tokens(&path)?;
+        // Both source grants expired long before wall-clock import time.
+        let report = storage
+            .import_recovery(source.clone(), policy.clone())
+            .await
+            .map_err(|error| format!("import failed: {error:?}"))?;
+        assert_eq!(
+            (
+                report.heads,
+                report.live_bytes,
+                report.descriptor_records,
+                report.descriptor_bytes
+            ),
+            (1, 4, 1, 4)
+        );
+        assert_eq!((report.recovery_records, report.recovery_bytes), (2, 12));
+        assert_eq!(
+            storage.recovery_metrics_snapshot(),
+            RecoveryMetricsSnapshot {
+                records_admitted: 2,
+                record_bytes_admitted: 12,
+                current_records: 2,
+                current_bytes: 12,
+            }
+        );
+        let tokens_after = admission_tokens(&path)?;
+        assert_eq!(tokens_before[0], tokens_after[0]);
+        assert_eq!(tokens_before[1] - 12, tokens_after[1]);
+        let page = storage
+            .fetch_recovery(recovery_fetch(100)?, 100)
+            .await
+            .map_err(|error| format!("fetch failed: {error:?}"))?
+            .map_err(|error| format!("fetch rejected: {error:?}"))?;
+        assert_eq!(
+            page.records
+                .iter()
+                .map(|record| record.id)
+                .collect::<Vec<_>>(),
+            vec![7, 14]
+        );
+        assert_eq!(
+            report,
+            storage
+                .import_recovery(source.clone(), policy.clone())
+                .await
+                .map_err(|error| format!("identical import retry failed: {error:?}"))?
+        );
+        assert_eq!(tokens_after, admission_tokens(&path)?);
+        assert_eq!(
+            storage.recovery_metrics_snapshot(),
+            RecoveryMetricsSnapshot {
+                current_records: 2,
+                current_bytes: 12,
+                ..RecoveryMetricsSnapshot::default()
+            }
+        );
+        owner.shutdown().await?;
+        assert_eq!(report, verify_backup(&path)?);
+        assert_eq!(
+            original,
+            fs::read(&source).map_err(|error| error.to_string())?
+        );
+        // Exact full retries also work after a capacity reduction and restart.
+        settings.max_live_bytes = 1;
+        let owner = StorageOwner::start(settings)?;
+        let mut reduced_policy = policy.clone();
+        reduced_policy.max_records = 1;
+        reduced_policy.max_bytes = 1;
+        assert_eq!(
+            report,
+            owner
+                .client()
+                .import_recovery(source.clone(), reduced_policy)
+                .await
+                .map_err(|error| format!("reduced-capacity retry failed: {error:?}"))?
+        );
+        owner.shutdown().await?;
+        // An offline copy contains wallet heads, descriptors and recovery rows together.
+        let restored = parent_of(&path)?.join("restored.sqlite3");
+        fs::copy(&path, &restored).map_err(|error| error.to_string())?;
+        assert_eq!(report, verify_backup(&restored)?);
+        let owner = StorageOwner::start(recovery_config(restored.clone()))?;
+        let storage = owner.client();
+        let (_, request) = recovery_fixture(3, 1)?;
+        let appended = store_recovery_fixture(&storage, policy, request)
+            .await?
+            .map_err(|error| format!("post-import append: {error:?}"))?;
+        assert_eq!(appended.id, 21);
+        owner.shutdown().await?;
+        fs::remove_dir_all(parent_of(&path)?).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_import_failures_leave_existing_heads_and_admission_untouched()
+    -> Result<(), String> {
+        for case in [
+            "aggregate",
+            "records",
+            "bytes",
+            "admission",
+            "origin",
+            "publisher",
+            "schema",
+            "ciphertext",
+            "sequence",
+            "locked",
+        ] {
+            let path = test_path(&format!("recovery-import-{case}"))?;
+            let source = parent_of(&path)?.join("legacy.sqlite3");
+            let mut policy = legacy_recovery_source(&source)?;
+            let mut settings = recovery_config(path.clone());
+            match case {
+                "aggregate" => settings.max_live_bytes = 15,
+                "records" => policy.max_records = 1,
+                "bytes" => policy.max_bytes = 11,
+                "admission" => settings.admission.total_growth_bytes.capacity = 15,
+                "origin" => policy.origin = "http://127.0.0.1:9001".to_owned(),
+                "publisher" => {
+                    policy.publisher = recovery_pair(3)?.x_only_public_key().0.to_string();
+                }
+                _ => (),
+            }
+            let source_connection = Connection::open(&source).map_err(|error| error.to_string())?;
+            match case {
+                "schema" => source_connection.execute_batch("DROP INDEX recovery_owner_id"),
+                "ciphertext" => source_connection
+                    .execute_batch("UPDATE recovery_records SET ciphertext=zeroblob(6)"),
+                "sequence" => source_connection.execute_batch("UPDATE sqlite_sequence SET seq=1"),
+                _ => Ok(()),
+            }
+            .map_err(|error| error.to_string())?;
+            drop(source_connection);
+            let source_lock = if case == "locked" {
+                let lock = OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(parent_of(&path)?.join("legacy.sqlite3.lock"))
+                    .map_err(|error| error.to_string())?;
+                fs2::FileExt::try_lock_exclusive(&lock).map_err(|error| error.to_string())?;
+                Some(lock)
+            } else {
+                None
+            };
+            let owner = StorageOwner::start(settings)?;
+            let storage = owner.client();
+            assert_eq!(
+                recovery_wallet(&storage, 4, 1, None).await?,
+                MutationOutcome::Applied
+            );
+            let tokens_before = admission_tokens(&path)?;
+            assert!(
+                storage.import_recovery(source, policy).await.is_err(),
+                "import accepted {case}"
+            );
+            assert_eq!(
+                tokens_before,
+                admission_tokens(&path)?,
+                "admission changed for {case}"
+            );
+            assert_eq!(
+                storage.recovery_metrics_snapshot(),
+                RecoveryMetricsSnapshot::default()
+            );
+            owner.shutdown().await?;
+            let report = verify_backup(&path)?;
+            assert_eq!(
+                (
+                    report.heads,
+                    report.live_bytes,
+                    report.recovery_records,
+                    report.recovery_bytes
+                ),
+                (1, 4, 0, 0)
+            );
+            drop(source_lock);
+            fs::remove_dir_all(parent_of(&path)?).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_import_rejects_nonidentical_target_without_overwriting_records()
+    -> Result<(), String> {
+        let path = test_path("recovery-import-conflict")?;
+        let source = parent_of(&path)?.join("legacy.sqlite3");
+        let policy = legacy_recovery_source(&source)?;
+        let owner = StorageOwner::start(recovery_config(path.clone()))?;
+        let storage = owner.client();
+        let (_, request) = recovery_fixture(3, 3)?;
+        let initial = store_recovery_fixture(&storage, policy.clone(), request)
+            .await?
+            .map_err(|error| format!("initial record: {error:?}"))?;
+        let tokens_before = admission_tokens(&path)?;
+        assert!(storage.import_recovery(source, policy).await.is_err());
+        assert_eq!(tokens_before, admission_tokens(&path)?);
+        let page = storage
+            .fetch_recovery(recovery_fetch(100)?, 100)
+            .await
+            .map_err(|error| format!("actor fetch: {error:?}"))?
+            .map_err(|error| format!("fetch: {error:?}"))?;
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(
+            page.records
+                .first()
+                .ok_or_else(|| "record missing".to_owned())?
+                .id,
+            initial.id
+        );
+        owner.shutdown().await?;
+        let report = verify_backup(&path)?;
+        assert_eq!((report.recovery_records, report.recovery_bytes), (1, 3));
+        fs::remove_dir_all(parent_of(&path)?).map_err(|error| error.to_string())?;
         Ok(())
     }
 }

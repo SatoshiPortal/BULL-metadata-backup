@@ -13,7 +13,15 @@ use crate::protocol::{
 };
 
 const PREFIX: &str = "BACKUP_SERVER_";
-const KNOWN: [&str; 45] = [
+const KNOWN: [&str; 53] = [
+    "BACKUP_SERVER_RECOVERY_FETCH_NPUB_LIMIT",
+    "BACKUP_SERVER_RECOVERY_FETCH_NPUB_WINDOW_SECS",
+    "BACKUP_SERVER_RECOVERY_STORE_NPUB_LIMIT",
+    "BACKUP_SERVER_RECOVERY_STORE_NPUB_WINDOW_SECS",
+    "BACKUP_SERVER_RECOVERY_ORIGIN",
+    "BACKUP_SERVER_RECOVERY_PUBLISHER",
+    "BACKUP_SERVER_RECOVERY_MAX_RECORDS",
+    "BACKUP_SERVER_RECOVERY_MAX_BYTES",
     "BACKUP_SERVER_BIND",
     "BACKUP_SERVER_DB_PATH",
     "BACKUP_SERVER_MAX_LIVE_BYTES",
@@ -69,6 +77,8 @@ pub struct WindowLimit {
 
 #[derive(Clone, Copy)]
 pub struct LimiterConfig {
+    pub recovery_fetch_npub: WindowLimit,
+    pub recovery_store_npub: WindowLimit,
     pub max_subjects: usize,
     pub overflow: WindowLimit,
     pub overflow_retry_after_secs: u64,
@@ -94,6 +104,7 @@ pub struct AdmissionConfig {
 
 #[derive(Clone)]
 pub struct Config {
+    pub recovery: Option<crate::recovery_prototype::RecoveryPolicy>,
     pub bind: SocketAddr,
     pub db_path: PathBuf,
     pub max_live_bytes: u64,
@@ -128,6 +139,32 @@ impl Config {
     #[allow(clippy::too_many_lines)]
     pub fn from_env() -> Result<Self, String> {
         reject_unknown_prefixed_env()?;
+        let recovery = match (
+            optional("BACKUP_SERVER_RECOVERY_ORIGIN")?,
+            optional("BACKUP_SERVER_RECOVERY_PUBLISHER")?,
+        ) {
+            (None, None) => {
+                if optional("BACKUP_SERVER_RECOVERY_MAX_RECORDS")?.is_some()
+                    || optional("BACKUP_SERVER_RECOVERY_MAX_BYTES")?.is_some()
+                {
+                    return Err(
+                        "recovery capacity requires recovery origin and publisher".to_owned()
+                    );
+                }
+                None
+            }
+            (Some(origin), Some(publisher)) => {
+                let policy = crate::recovery_prototype::RecoveryPolicy {
+                    origin,
+                    publisher,
+                    max_records: optional_u64("BACKUP_SERVER_RECOVERY_MAX_RECORDS", 10_000)?,
+                    max_bytes: optional_u64("BACKUP_SERVER_RECOVERY_MAX_BYTES", 256 * 1024 * 1024)?,
+                };
+                policy.validate()?;
+                Some(policy)
+            }
+            _ => return Err("recovery origin and publisher must be configured together".to_owned()),
+        };
         let bind = optional("BACKUP_SERVER_BIND")?
             .unwrap_or_else(|| "127.0.0.1:3000".to_owned())
             .parse::<SocketAddr>()
@@ -228,6 +265,18 @@ impl Config {
         }
 
         let limiter = LimiterConfig {
+            recovery_fetch_npub: window_limit(
+                "BACKUP_SERVER_RECOVERY_FETCH_NPUB_LIMIT",
+                2500,
+                "BACKUP_SERVER_RECOVERY_FETCH_NPUB_WINDOW_SECS",
+                3600,
+            )?,
+            recovery_store_npub: window_limit(
+                "BACKUP_SERVER_RECOVERY_STORE_NPUB_LIMIT",
+                256,
+                "BACKUP_SERVER_RECOVERY_STORE_NPUB_WINDOW_SECS",
+                3600,
+            )?,
             max_subjects: positive_usize("BACKUP_SERVER_LIMITER_MAX_SUBJECTS")?,
             overflow: window_limit(
                 "BACKUP_SERVER_LIMITER_OVERFLOW_LIMIT",
@@ -346,6 +395,7 @@ impl Config {
         )?);
 
         Ok(Self {
+            recovery,
             bind,
             db_path,
             max_live_bytes,

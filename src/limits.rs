@@ -28,6 +28,10 @@ pub struct RateLimiter {
 
 #[derive(Default)]
 struct State {
+    recovery_fetch_by_npub: HashMap<[u8; 32], VecDeque<Instant>>,
+    recovery_store_by_npub: HashMap<[u8; 32], VecDeque<Instant>>,
+    recovery_fetch_overflow: VecDeque<Instant>,
+    recovery_store_overflow: VecDeque<Instant>,
     fetch_by_npub: HashMap<[u8; 32], VecDeque<Instant>>,
     mutation_by_npub: HashMap<[u8; 32], VecDeque<Instant>>,
     descriptor_store_by_npub: HashMap<[u8; 32], VecDeque<Instant>>,
@@ -50,6 +54,26 @@ impl State {
             return;
         }
         self.last_full_prune = Some(now);
+        prune_windows(
+            &mut self.recovery_fetch_by_npub,
+            config.recovery_fetch_npub.window,
+            now,
+        );
+        prune_windows(
+            &mut self.recovery_store_by_npub,
+            config.recovery_store_npub.window,
+            now,
+        );
+        prune_events(
+            &mut self.recovery_fetch_overflow,
+            config.overflow.window,
+            now,
+        );
+        prune_events(
+            &mut self.recovery_store_overflow,
+            config.overflow.window,
+            now,
+        );
         prune_windows(&mut self.fetch_by_npub, config.fetch_npub.window, now);
         prune_windows(&mut self.mutation_by_npub, config.mutation_npub.window, now);
         prune_windows(
@@ -88,6 +112,8 @@ impl RateLimiter {
             || config.prune_interval.is_zero()
             || [
                 config.overflow,
+                config.recovery_fetch_npub,
+                config.recovery_store_npub,
                 config.fetch_npub,
                 config.mutation_npub,
                 config.descriptor_store_npub,
@@ -105,6 +131,20 @@ impl RateLimiter {
             salt,
             config,
         })
+    }
+
+    pub fn check_recovery_fetch_npub(&self, npub: &[u8; 32]) -> Result<(), LimitError> {
+        self.check(
+            self.digest(b"recovery-fetch-npub", npub),
+            Axis::RecoveryFetch,
+        )
+    }
+
+    pub fn check_recovery_store_npub(&self, npub: &[u8; 32]) -> Result<(), LimitError> {
+        self.check(
+            self.digest(b"recovery-store-npub", npub),
+            Axis::RecoveryStore,
+        )
     }
 
     pub fn check_fetch_npub(&self, npub: &[u8; 32]) -> Result<(), LimitError> {
@@ -141,6 +181,10 @@ impl RateLimiter {
         let now = Instant::now();
         state.prune_all_if_due(&self.config, now);
         let State {
+            recovery_fetch_by_npub,
+            recovery_store_by_npub,
+            recovery_fetch_overflow,
+            recovery_store_overflow,
             fetch_by_npub,
             mutation_by_npub,
             descriptor_store_by_npub,
@@ -152,6 +196,16 @@ impl RateLimiter {
             ..
         } = &mut *state;
         let (map, overflow, limit) = match axis {
+            Axis::RecoveryFetch => (
+                recovery_fetch_by_npub,
+                recovery_fetch_overflow,
+                self.config.recovery_fetch_npub,
+            ),
+            Axis::RecoveryStore => (
+                recovery_store_by_npub,
+                recovery_store_overflow,
+                self.config.recovery_store_npub,
+            ),
             Axis::Fetch => (fetch_by_npub, fetch_overflow, self.config.fetch_npub),
             Axis::Mutation => (
                 mutation_by_npub,
@@ -192,6 +246,8 @@ impl RateLimiter {
 
 #[derive(Clone, Copy)]
 enum Axis {
+    RecoveryFetch,
+    RecoveryStore,
     Fetch,
     Mutation,
     DescriptorStore,
@@ -285,6 +341,14 @@ mod tests {
 
     fn config() -> LimiterConfig {
         LimiterConfig {
+            recovery_fetch_npub: WindowLimit {
+                requests: 2500,
+                window: Duration::from_secs(3600),
+            },
+            recovery_store_npub: WindowLimit {
+                requests: 256,
+                window: Duration::from_secs(3600),
+            },
             max_subjects: 2,
             overflow: window(2, 60),
             overflow_retry_after_secs: 17,
@@ -294,6 +358,39 @@ mod tests {
             descriptor_store_npub: window(2, 60),
             descriptor_lookup: window(3, 60),
         }
+    }
+
+    #[test]
+    fn recovery_pagination_has_independent_owner_limits() -> Result<(), String> {
+        let mut limits = config();
+        limits.recovery_fetch_npub = window(126, 3600);
+        limits.recovery_store_npub = window(2, 3600);
+        let limiter = RateLimiter::new(limits)?;
+        for _ in 0..126 {
+            limiter
+                .check_recovery_fetch_npub(&[1; 32])
+                .map_err(|e| format!("{e:?}"))?;
+        }
+        assert!(matches!(
+            limiter.check_recovery_fetch_npub(&[1; 32]),
+            Err(LimitError::Exceeded { .. })
+        ));
+        for _ in 0..2 {
+            limiter
+                .check_recovery_store_npub(&[1; 32])
+                .map_err(|e| format!("{e:?}"))?;
+        }
+        assert!(matches!(
+            limiter.check_recovery_store_npub(&[1; 32]),
+            Err(LimitError::Exceeded { .. })
+        ));
+        limiter
+            .check_fetch_npub(&[1; 32])
+            .map_err(|e| format!("{e:?}"))?;
+        limiter
+            .check_mutation_npub(&[1; 32])
+            .map_err(|e| format!("{e:?}"))?;
+        Ok(())
     }
 
     #[test]

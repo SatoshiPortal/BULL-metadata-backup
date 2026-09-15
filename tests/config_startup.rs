@@ -45,6 +45,39 @@ fn contradictory_size_and_concurrency_configuration_fails_startup() -> Result<()
 }
 
 #[test]
+fn recovery_configuration_fails_closed() -> Result<(), String> {
+    assert!(
+        invalid_startup(&[("BACKUP_SERVER_RECOVERY_ORIGIN", "https://backup.example")])?
+            .contains("configured together")
+    );
+    assert!(
+        invalid_startup(&[("BACKUP_SERVER_RECOVERY_MAX_RECORDS", "10")])?
+            .contains("requires recovery origin")
+    );
+    for origin in [
+        "https://",
+        "https://backup.example/path",
+        "https://user@backup.example",
+        "http://backup.example",
+        "https://backup.example?query",
+    ] {
+        let result = invalid_startup(&[
+            ("BACKUP_SERVER_RECOVERY_ORIGIN", origin),
+            (
+                "BACKUP_SERVER_RECOVERY_PUBLISHER",
+                "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+            ),
+        ])?;
+        assert!(result.contains("invalid recovery"));
+    }
+    assert!(
+        invalid_startup(&[("BACKUP_SERVER_RECOVERY_FETCH_NPUB_LIMIT", "0")])?
+            .contains("must be positive")
+    );
+    Ok(())
+}
+
+#[test]
 fn contradictory_capacity_and_admission_configuration_fails_startup() -> Result<(), String> {
     let impossible_shape = invalid_startup(&[("BACKUP_SERVER_MAX_LIVE_BYTES", "94371839999")])?;
     assert!(impossible_shape.contains("must not exceed BACKUP_SERVER_MAX_LIVE_BYTES"));

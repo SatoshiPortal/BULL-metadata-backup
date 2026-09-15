@@ -22,7 +22,7 @@ use tokio::sync::Semaphore;
 const MAX_RECORD: usize = 128 * 1024;
 const MAX_GRANT_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_OWNER_BYTES: i64 = 16 * 1024 * 1024;
-const MAX_GLOBAL_BYTES: i64 = 256 * 1024 * 1024;
+const MAX_GLOBAL_BYTES: u64 = 256 * 1024 * 1024;
 const PAGE: i64 = 8;
 const DOMAIN: &str = "bullbitcoin-arkade-recovery-prototype-v1";
 const SCHEMA: &str = "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF;
@@ -30,7 +30,7 @@ const SCHEMA: &str = "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGM
         CREATE TABLE IF NOT EXISTS recovery_records(id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, grant_id TEXT NOT NULL, hash TEXT NOT NULL, ciphertext BLOB NOT NULL, grant_json TEXT NOT NULL, UNIQUE(owner,grant_id,hash));
         CREATE INDEX IF NOT EXISTS recovery_owner_id ON recovery_records(owner,id);";
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Grant {
     pub owner: String,
@@ -45,7 +45,7 @@ pub struct Grant {
     pub signature: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoreRequest {
     pub grant: Grant,
@@ -56,7 +56,7 @@ pub struct StoreRequest {
     pub signature: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FetchRequest {
     pub owner: String,
@@ -66,13 +66,13 @@ pub struct FetchRequest {
     pub signature: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Receipt {
     pub id: i64,
     pub ciphertext_sha256: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Record {
     pub id: i64,
     pub grant: Grant,
@@ -80,11 +80,49 @@ pub struct Record {
     pub ciphertext_sha256: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Page {
     pub records: Vec<Record>,
     pub snapshot: u64,
     pub next_after: Option<u64>,
+}
+
+/// Per-deployment capacity; owner and grant limits remain wire-compatible.
+#[derive(Debug, Clone)]
+pub struct RecoveryPolicy {
+    pub origin: String,
+    pub publisher: String,
+    pub max_records: u64,
+    pub max_bytes: u64,
+}
+
+impl RecoveryPolicy {
+    pub fn validate(&self) -> Result<(), String> {
+        let uri = self
+            .origin
+            .parse::<axum::http::Uri>()
+            .map_err(|_| "invalid recovery origin".to_owned())?;
+        let allowed_scheme = uri.scheme_str() == Some("https")
+            || (uri.scheme_str() == Some("http")
+                && uri.host() == Some("127.0.0.1")
+                && uri.port_u16().is_some());
+        if !allowed_scheme
+            || uri.host().is_none()
+            || uri.path() != "/"
+            || key(&self.publisher).is_err()
+            || self.origin.contains(['\0', '?', '#', '@'])
+            || self.origin.ends_with('/')
+            || !(self.origin.starts_with("https://")
+                || self.origin.starts_with("http://127.0.0.1:"))
+            || self.max_records == 0
+            || self.max_records > i64::MAX as u64
+            || self.max_bytes == 0
+            || self.max_bytes > i64::MAX as u64
+        {
+            return Err("invalid recovery publisher, origin or capacity".to_owned());
+        }
+        Ok(())
+    }
 }
 
 struct Database {
@@ -100,7 +138,7 @@ struct App {
 }
 
 #[derive(Debug)]
-struct Error(StatusCode);
+pub struct Error(pub StatusCode);
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         (
@@ -191,18 +229,19 @@ fn fresh(timestamp: u64, clock: u64) -> Result<(), Error> {
     Ok(())
 }
 
+#[allow(dead_code)] // The standalone compatibility binary uses this launcher.
 pub fn app(
     path: &str,
     origin: String,
     publisher: String,
 ) -> Result<Router, Box<dyn std::error::Error>> {
-    if key(&publisher).is_err()
-        || origin.contains('\0')
-        || origin.ends_with('/')
-        || !(origin.starts_with("https://") || origin.starts_with("http://127.0.0.1:"))
-    {
-        return Err("invalid configured publisher or origin".into());
+    RecoveryPolicy {
+        origin: origin.clone(),
+        publisher: publisher.clone(),
+        max_records: 10_000,
+        max_bytes: MAX_GLOBAL_BYTES,
     }
+    .validate()?;
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -220,6 +259,7 @@ pub fn app(
         .open(path)?;
     let conn = Connection::open(path)?;
     conn.execute_batch(SCHEMA)?;
+    verify_rows(&conn)?;
     let state = App {
         db: Arc::new(Mutex::new(Database { conn, _lock: lock })),
         slots: Arc::new(Semaphore::new(8)),
@@ -256,11 +296,15 @@ async fn store(
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(receipt)))
 }
 
-fn validate_store(app: &App, req: &StoreRequest, clock: u64) -> Result<Vec<u8>, Error> {
+pub fn validate_store(
+    policy: &RecoveryPolicy,
+    req: &StoreRequest,
+    clock: u64,
+) -> Result<Vec<u8>, Error> {
     fresh(req.timestamp, clock)?;
     let g = &req.grant;
-    if g.origin != app.origin
-        || g.publisher != app.publisher
+    if g.origin != policy.origin
+        || g.publisher != policy.publisher
         || g.max_records == 0
         || g.max_records > 16
         || g.max_bytes == 0
@@ -287,10 +331,38 @@ fn validate_store(app: &App, req: &StoreRequest, clock: u64) -> Result<Vec<u8>, 
 }
 
 fn store_record(app: &App, req: &StoreRequest, clock: u64) -> Result<Receipt, Error> {
-    let raw = validate_store(app, req, clock)?;
-    let g = &req.grant;
+    let policy = RecoveryPolicy {
+        origin: app.origin.clone(),
+        publisher: app.publisher.clone(),
+        max_records: 10_000,
+        max_bytes: MAX_GLOBAL_BYTES,
+    };
     let mut db = app.db.lock().map_err(internal)?;
-    let tx = db.conn.transaction().map_err(internal)?;
+    store_on_connection(&mut db.conn, &policy, req, clock, u64::MAX)
+}
+
+pub fn store_on_connection(
+    connection: &mut Connection,
+    policy: &RecoveryPolicy,
+    req: &StoreRequest,
+    clock: u64,
+    aggregate_available_bytes: u64,
+) -> Result<Receipt, Error> {
+    let tx = connection.transaction().map_err(internal)?;
+    let receipt = store_in_transaction(&tx, policy, req, clock, aggregate_available_bytes)?;
+    tx.commit().map_err(internal)?;
+    Ok(receipt)
+}
+
+pub fn store_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    policy: &RecoveryPolicy,
+    req: &StoreRequest,
+    clock: u64,
+    aggregate_available_bytes: u64,
+) -> Result<Receipt, Error> {
+    let raw = validate_store(policy, req, clock)?;
+    let g = &req.grant;
     let grant_hash = hex::encode(grant_digest(g));
     let prior: Option<String> = tx
         .query_row(
@@ -338,7 +410,7 @@ fn store_record(app: &App, req: &StoreRequest, clock: u64) -> Result<Receipt, Er
             |r| r.get(0),
         )
         .map_err(internal)?;
-    let (global_count, global_bytes): (i64, i64) = tx
+    let (global_count, global_bytes): (u64, u64) = tx
         .query_row(
             "SELECT COUNT(*),COALESCE(SUM(length(ciphertext)),0) FROM recovery_records",
             [],
@@ -346,11 +418,20 @@ fn store_record(app: &App, req: &StoreRequest, clock: u64) -> Result<Receipt, Er
         )
         .map_err(internal)?;
     let length = i64::try_from(raw.len()).map_err(internal)?;
+    let owner_count: u64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM recovery_records WHERE owner=?",
+            [&g.owner],
+            |r| r.get(0),
+        )
+        .map_err(internal)?;
     if count >= g.max_records
         || bytes + req.ciphertext_bytes > g.max_bytes
         || owner_bytes + length > MAX_OWNER_BYTES
-        || global_count >= 10000
-        || global_bytes + length > MAX_GLOBAL_BYTES
+        || owner_count >= 10_000
+        || global_count >= policy.max_records
+        || global_bytes + req.ciphertext_bytes > policy.max_bytes
+        || req.ciphertext_bytes > aggregate_available_bytes
     {
         return Err(Error(StatusCode::INSUFFICIENT_STORAGE));
     }
@@ -371,7 +452,6 @@ fn store_record(app: &App, req: &StoreRequest, clock: u64) -> Result<Receipt, Er
     )
     .map_err(internal)?;
     let id = tx.last_insert_rowid();
-    tx.commit().map_err(internal)?;
     Ok(Receipt {
         id,
         ciphertext_sha256: req.ciphertext_sha256.clone(),
@@ -397,6 +477,11 @@ async fn fetch(
 }
 
 fn fetch_records(app: &App, req: &FetchRequest, clock: u64) -> Result<Page, Error> {
+    let db = app.db.lock().map_err(internal)?;
+    fetch_on_connection(&db.conn, req, clock)
+}
+
+pub fn validate_fetch(req: &FetchRequest, clock: u64) -> Result<(), Error> {
     fresh(req.timestamp, clock)?;
     verify(&req.owner, &fetch_digest(req), &req.signature)?;
     if req.after > i64::MAX as u64
@@ -405,9 +490,16 @@ fn fetch_records(app: &App, req: &FetchRequest, clock: u64) -> Result<Page, Erro
     {
         return Err(bad());
     }
-    let db = app.db.lock().map_err(internal)?;
-    let latest: u64 = db
-        .conn
+    Ok(())
+}
+
+pub fn fetch_on_connection(
+    connection: &Connection,
+    req: &FetchRequest,
+    clock: u64,
+) -> Result<Page, Error> {
+    validate_fetch(req, clock)?;
+    let latest: u64 = connection
         .query_row(
             "SELECT COALESCE(MAX(id),0) FROM recovery_records WHERE owner=?",
             [&req.owner],
@@ -424,8 +516,7 @@ fn fetch_records(app: &App, req: &FetchRequest, clock: u64) -> Result<Page, Erro
     }
     for anchor in [req.after, snapshot] {
         if anchor != 0 {
-            let exists: bool = db
-                .conn
+            let exists: bool = connection
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE owner=? AND id=?)",
                     params![req.owner, anchor],
@@ -437,7 +528,7 @@ fn fetch_records(app: &App, req: &FetchRequest, clock: u64) -> Result<Page, Erro
             }
         }
     }
-    let mut query = db.conn.prepare("SELECT id,grant_json,ciphertext,hash FROM recovery_records WHERE owner=? AND id>? AND id<=? ORDER BY id LIMIT ?").map_err(internal)?;
+    let mut query = connection.prepare("SELECT id,grant_json,ciphertext,hash FROM recovery_records WHERE owner=? AND id>? AND id<=? ORDER BY id LIMIT ?").map_err(internal)?;
     let rows = query
         .query_map(params![req.owner, req.after, snapshot, PAGE + 1], |r| {
             Ok((
@@ -469,6 +560,71 @@ fn fetch_records(app: &App, req: &FetchRequest, clock: u64) -> Result<Page, Erro
         snapshot,
         next_after,
     })
+}
+
+/// Verify retained records without applying request freshness or append expiry.
+pub fn verify_rows(connection: &Connection) -> Result<(u64, u64, String), String> {
+    fn checked(connection: &Connection) -> Result<(u64, u64, String), Error> {
+        let mut query = connection.prepare("SELECT id,owner,grant_id,hash,length(ciphertext),ciphertext,grant_json FROM recovery_records ORDER BY id").map_err(internal)?;
+        let mut rows = query.query([]).map_err(internal)?;
+        let mut digest = Sha256::new();
+        digest.update(b"bull-recovery-records-v1");
+        let mut count = 0_u64;
+        let mut bytes = 0_u64;
+        while let Some(row) = rows.next().map_err(internal)? {
+            let id: i64 = row.get(0).map_err(internal)?;
+            let owner: String = row.get(1).map_err(internal)?;
+            let grant_id: String = row.get(2).map_err(internal)?;
+            let hash: String = row.get(3).map_err(internal)?;
+            let length: u64 = row.get(4).map_err(internal)?;
+            if id <= 0 || length == 0 || length > MAX_RECORD as u64 {
+                return Err(bad());
+            }
+            let raw: Vec<u8> = row.get(5).map_err(internal)?;
+            let grant_json: String = row.get(6).map_err(internal)?;
+            let grant: Grant = serde_json::from_str(&grant_json).map_err(internal)?;
+            let grant_hash = hex::encode(grant_digest(&grant));
+            if owner != grant.owner
+                || grant_id != grant.id
+                || hash != hex::encode(Sha256::digest(&raw))
+                || grant.max_records == 0
+                || grant.max_records > 16
+                || grant.max_bytes == 0
+                || grant.max_bytes > MAX_GRANT_BYTES
+                || grant.expires_at <= grant.valid_from
+                || grant.expires_at - grant.valid_from > 32 * 86400
+            {
+                return Err(bad());
+            }
+            hex_bytes(&grant.id, 32)?;
+            hex_bytes(&grant.scope, 32)?;
+            key(&grant.publisher)?;
+            verify(&owner, &grant_digest(&grant), &grant.signature)?;
+            let stored: String = connection
+                .query_row(
+                    "SELECT digest FROM recovery_grants WHERE owner=? AND grant_id=?",
+                    params![owner, grant_id],
+                    |r| r.get(0),
+                )
+                .map_err(internal)?;
+            if stored != grant_hash {
+                return Err(bad());
+            }
+            digest.update(id.to_be_bytes());
+            digest.update(hex_bytes(&owner, 32)?);
+            digest.update(hex_bytes(&grant_id, 32)?);
+            digest.update(hex_bytes(&grant_hash, 32)?);
+            digest.update(hex_bytes(&hash, 32)?);
+            count += 1;
+            bytes = bytes.checked_add(length).ok_or_else(bad)?;
+        }
+        let invalid: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM recovery_grants g WHERE NOT EXISTS(SELECT 1 FROM recovery_records r WHERE r.owner=g.owner AND r.grant_id=g.grant_id)) OR EXISTS(SELECT 1 FROM recovery_records GROUP BY owner HAVING COUNT(*)>10000 OR SUM(length(ciphertext))>16777216) OR EXISTS(SELECT 1 FROM recovery_records GROUP BY owner,grant_id HAVING COUNT(*)>json_extract(grant_json,'$.max_records') OR SUM(length(ciphertext))>json_extract(grant_json,'$.max_bytes'))", [], |r| r.get(0)).map_err(internal)?;
+        if invalid {
+            return Err(bad());
+        }
+        Ok((count, bytes, hex::encode(digest.finalize())))
+    }
+    checked(connection).map_err(|_| "recovery record verification failed".to_owned())
 }
 
 #[cfg(test)]

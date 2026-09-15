@@ -3,7 +3,7 @@
 `backup-server` stores opaque encrypted data for BIP340 public keys. It cannot
 decrypt or interpret anything it stores.
 
-It serves two independent resources.
+It serves three independent resources. Delegated recovery is opt-in.
 
 **Wallet backups** are one authenticated head per public key, replaced in
 place:
@@ -18,6 +18,16 @@ tokens the client derives and the server never interprets:
 
 - `POST /api/v1/descriptor-backups`
 - `POST /api/v1/descriptor-backups/lookup`
+
+**Delegated Ark recovery records** are immutable ciphertext publications encrypted
+to the user's Nostr key, with owner-signed grants and fetch requests:
+
+- `POST /api/v1/arkade-recovery-records`
+- `POST /api/v1/arkade-recovery-records/fetch`
+
+They use the same listener, database worker, capacity accounting and operational
+backup as the other resources. See [recovery deployment](docs/recovery-deployment.md)
+for configuration, importing historical prototype records and rollback limits.
 
 The descriptor resource is additive. It changes no wallet backup request
 format, response, or semantic.
@@ -91,9 +101,12 @@ does not replace the proxy's per-source and global limits.
 The database carries a schema version. A version 1 database is upgraded to
 version 2 on startup by adding the two descriptor tables and their index; the
 upgrade never reads or writes `wallet_backup_heads`, and a fresh database is
-built by running the same migration. An aggregate verification digest is
-unchanged by the upgrade alone, so an operator comparing before and after
-sees drift only when descriptor records actually exist.
+built by running the same migration. Version 3 then adds recovery tables in a
+verified transaction without rewriting wallet or descriptor records. The
+version-3 verification digest also covers recovery records and their cursor
+high-water mark; compare digests produced by the same verifier version. Keep the
+original pre-upgrade database and matching verifier when migrating an old copy.
+Older binaries reject version 3 and cannot serve as a rollback for that database.
 
 ## Back up
 
@@ -108,7 +121,8 @@ backup-server verify-backup /srv/backup-server/backup-2026-08-26.sqlite3
 ```
 
 `verify-backup` checks what generic tooling cannot: schema shape, admission
-rows, head and byte consistency, and descriptor lookup associations. Each
+rows, head and byte consistency, descriptor lookup associations, recovery grant
+signatures, ciphertext hashes, quotas and cursor high-water marks. Each
 descriptor must have 1–16 valid associations; no association may point at a
 missing record. The aggregate digest includes descriptor contents, cursor
 identities and sorted lookup associations for before-and-after comparison.

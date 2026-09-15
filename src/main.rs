@@ -3,6 +3,7 @@
 mod config;
 mod limits;
 mod protocol;
+mod recovery_prototype;
 mod storage;
 
 use std::env;
@@ -47,6 +48,7 @@ const SOURCE_IDENTITY_HEADER: &str = "x-real-ip";
 
 #[derive(Clone)]
 struct AppState {
+    recovery: Option<recovery_prototype::RecoveryPolicy>,
     storage: Storage,
     limiter: RateLimiter,
     fetch_in_flight: Arc<Semaphore>,
@@ -273,6 +275,26 @@ async fn run() -> Result<(), String> {
             }
             serve(config::Config::from_env()?).await
         }
+        "import-recovery" => {
+            let source = next_path(&mut arguments)?;
+            if arguments.next().is_some() {
+                return Err(usage());
+            }
+            let config = config::Config::from_env()?;
+            let policy = config
+                .recovery
+                .clone()
+                .ok_or("import requires recovery configuration")?;
+            let owner = StorageOwner::start(storage_config(&config))?;
+            let result = owner.client().import_recovery(source, policy).await;
+            owner.shutdown().await?;
+            let report = result.map_err(|_| "recovery import failed; verify the offline source, configured origin/publisher and destination capacity; target records must be empty or identical")?;
+            println!(
+                "imported recovery: records={} bytes={} recovery_sha256={}",
+                report.recovery_records, report.recovery_bytes, report.recovery_sha256
+            );
+            Ok(())
+        }
         "verify-backup" => {
             let path = next_path(&mut arguments)?;
             if arguments.next().is_some() {
@@ -280,11 +302,14 @@ async fn run() -> Result<(), String> {
             }
             let report = storage::verify_backup(&path)?;
             println!(
-                "verified backup: heads={} live_bytes={} descriptor_records={} descriptor_bytes={} aggregate_sha256={}",
+                "verified backup: heads={} live_bytes={} descriptor_records={} descriptor_bytes={} recovery_records={} recovery_bytes={} recovery_sha256={} aggregate_sha256={}",
                 report.heads,
                 report.live_bytes,
                 report.descriptor_records,
                 report.descriptor_bytes,
+                report.recovery_records,
+                report.recovery_bytes,
+                report.recovery_sha256,
                 report.aggregate_sha256
             );
             Ok(())
@@ -294,7 +319,7 @@ async fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: backup-server serve | verify-backup <absolute-path>".to_owned()
+    "usage: backup-server serve | verify-backup <absolute-path> | import-recovery <absolute-offline-source>".to_owned()
 }
 
 fn next_path(arguments: &mut impl Iterator<Item = std::ffi::OsString>) -> Result<PathBuf, String> {
@@ -317,14 +342,8 @@ fn init_logging() -> Result<(), String> {
         .map_err(|_| "failed to initialize logging".to_owned())
 }
 
-async fn serve(config: config::Config) -> Result<(), String> {
-    let limiter = RateLimiter::new(config.limiter)?;
-    let request_totals = Arc::new(RequestTotals::new(config.request_totals_interval));
-    let descriptor_totals = Arc::new(DescriptorTotals::new(config.request_totals_interval));
-    let listener = tokio::net::TcpListener::bind(config.bind)
-        .await
-        .map_err(|_| "failed to bind loopback listener".to_owned())?;
-    let owner = StorageOwner::start(StorageConfig {
+fn storage_config(config: &config::Config) -> StorageConfig {
+    StorageConfig {
         path: config.db_path.clone(),
         queue_depth: config.storage_queue_depth,
         busy_timeout: config.busy_timeout,
@@ -333,9 +352,20 @@ async fn serve(config: config::Config) -> Result<(), String> {
         max_descriptor_records: config.max_descriptor_records,
         max_descriptor_records_per_publisher: config.max_descriptor_records_per_publisher,
         admission: config.admission,
-    })?;
+    }
+}
+
+async fn serve(config: config::Config) -> Result<(), String> {
+    let limiter = RateLimiter::new(config.limiter)?;
+    let request_totals = Arc::new(RequestTotals::new(config.request_totals_interval));
+    let descriptor_totals = Arc::new(DescriptorTotals::new(config.request_totals_interval));
+    let listener = tokio::net::TcpListener::bind(config.bind)
+        .await
+        .map_err(|_| "failed to bind loopback listener".to_owned())?;
+    let owner = StorageOwner::start(storage_config(&config))?;
     let storage = owner.client();
     let state = AppState {
+        recovery: config.recovery.clone(),
         storage: storage.clone(),
         limiter,
         fetch_in_flight: Arc::new(Semaphore::new(config.fetch_max_in_flight)),
@@ -454,7 +484,92 @@ fn router(
             post(lookup_descriptors).layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT_BYTES)),
         )
         .route("/healthz", get(health))
+        .route(
+            "/api/v1/arkade-recovery-records",
+            post(store_recovery).layer(DefaultBodyLimit::max(192 * 1024)),
+        )
+        .route(
+            "/api/v1/arkade-recovery-records/fetch",
+            post(fetch_recovery).layer(DefaultBodyLimit::max(4096)),
+        )
         .with_state(state)
+}
+
+fn recovery_storage_error(error: CallError) -> recovery_prototype::Error {
+    recovery_prototype::Error(match error {
+        CallError::QueueFull => StatusCode::TOO_MANY_REQUESTS,
+        CallError::Unavailable | CallError::Storage => StatusCode::SERVICE_UNAVAILABLE,
+    })
+}
+
+async fn store_recovery(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Request,
+) -> Result<Response, recovery_prototype::Error> {
+    use recovery_prototype::Error;
+    let policy = state.recovery.clone().ok_or(Error(StatusCode::NOT_FOUND))?;
+    let _permit = state
+        .store_in_flight
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| Error(StatusCode::TOO_MANY_REQUESTS))?;
+    source_identity(&headers).map_err(|_| Error(StatusCode::BAD_REQUEST))?;
+    let Json(request) = Json::<recovery_prototype::StoreRequest>::from_request(request, &state)
+        .await
+        .map_err(|e| Error(e.status()))?;
+    let clock = unix_time().map_err(|_| Error(StatusCode::INTERNAL_SERVER_ERROR))?;
+    recovery_prototype::validate_store(&policy, &request, clock)?;
+    let author = decode_canonical_hex::<32>(&request.grant.owner, "invalid recovery owner")
+        .map_err(|_| Error(StatusCode::BAD_REQUEST))?;
+    state
+        .limiter
+        .check_recovery_store_npub(&author)
+        .map_err(|_| Error(StatusCode::TOO_MANY_REQUESTS))?;
+    let receipt = state
+        .storage
+        .store_recovery(policy, request, clock)
+        .await
+        .map_err(recovery_storage_error)??;
+    Ok(private_no_store(Json(receipt).into_response()))
+}
+
+async fn fetch_recovery(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Request,
+) -> Result<Response, recovery_prototype::Error> {
+    use recovery_prototype::Error;
+    state
+        .recovery
+        .as_ref()
+        .ok_or(Error(StatusCode::NOT_FOUND))?;
+    let _permit = state
+        .fetch_in_flight
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| Error(StatusCode::TOO_MANY_REQUESTS))?;
+    source_identity(&headers).map_err(|_| Error(StatusCode::BAD_REQUEST))?;
+    let Json(request) = Json::<recovery_prototype::FetchRequest>::from_request(request, &state)
+        .await
+        .map_err(|e| Error(e.status()))?;
+    let clock = unix_time().map_err(|_| Error(StatusCode::INTERNAL_SERVER_ERROR))?;
+    recovery_prototype::validate_fetch(&request, clock)?;
+    let owner = request.owner.clone();
+    let page = state
+        .storage
+        .fetch_recovery(request, clock)
+        .await
+        .map_err(recovery_storage_error)??;
+    let author = decode_canonical_hex::<32>(&owner, "invalid recovery owner")
+        .map_err(|_| Error(StatusCode::BAD_REQUEST))?;
+    if !page.records.is_empty() {
+        state
+            .limiter
+            .check_recovery_fetch_npub(&author)
+            .map_err(|_| Error(StatusCode::TOO_MANY_REQUESTS))?;
+    }
+    Ok(private_no_store(Json(page).into_response()))
 }
 
 async fn wait_for_shutdown(mut receiver: watch::Receiver<bool>) {
@@ -549,6 +664,8 @@ async fn request_totals_loop(
             _ = ticker.tick() => {
                 totals.emit(storage.metrics_snapshot());
                 descriptor_totals.emit(storage.descriptor_metrics_snapshot());
+                let recovery = storage.recovery_metrics_snapshot();
+                tracing::info!(event = "recovery_storage_totals", records_admitted = recovery.records_admitted, bytes_admitted = recovery.record_bytes_admitted, current_records = recovery.current_records, current_bytes = recovery.current_bytes, "recovery storage totals");
             }
         }
     }
@@ -1224,6 +1341,14 @@ mod tests {
             window: Duration::from_secs(60),
         };
         LimiterConfig {
+            recovery_fetch_npub: WindowLimit {
+                requests: 2500,
+                window: Duration::from_secs(3600),
+            },
+            recovery_store_npub: WindowLimit {
+                requests: 256,
+                window: Duration::from_secs(3600),
+            },
             max_subjects: 16,
             overflow: limit,
             overflow_retry_after_secs: 900,
@@ -1244,6 +1369,13 @@ mod tests {
     }
 
     fn test_state(name: &str) -> Result<(PathBuf, StorageOwner, AppState), String> {
+        test_state_with_capacity(name, 1024)
+    }
+
+    fn test_state_with_capacity(
+        name: &str,
+        capacity: u64,
+    ) -> Result<(PathBuf, StorageOwner, AppState), String> {
         let mut random = [0_u8; 8];
         getrandom::fill(&mut random).map_err(|_| "randomness unavailable".to_owned())?;
         let directory =
@@ -1253,13 +1385,19 @@ mod tests {
             path: directory.join("backup.sqlite3"),
             queue_depth: 8,
             busy_timeout: Duration::from_secs(1),
-            max_live_bytes: 1024,
+            max_live_bytes: capacity,
             max_heads: 4,
             max_descriptor_records: 16,
             max_descriptor_records_per_publisher: 4,
-            admission: test_admission(),
+            admission: {
+                let mut admission = test_admission();
+                admission.total_growth_bytes.capacity = capacity;
+                admission.total_growth_bytes.refill = capacity;
+                admission
+            },
         })?;
         let state = AppState {
+            recovery: None,
             storage: owner.client(),
             limiter: RateLimiter::new(test_limiter())?,
             fetch_in_flight: Arc::new(Semaphore::new(4)),
@@ -1326,6 +1464,173 @@ mod tests {
             .split_once("\n}")
             .map(|(body, _)| body)
             .ok_or_else(|| format!("nginx location @{name} is unterminated"))
+    }
+
+    fn recovery_fixture_key(value: &serde_json::Value, name: &str) -> Result<Keypair, String> {
+        let encoded = value["public_test_keys"][name]
+            .as_str()
+            .ok_or("missing public test key")?;
+        let bytes: [u8; 32] = hex::decode(encoded)
+            .map_err(|_| "invalid test hex")?
+            .try_into()
+            .map_err(|_| "invalid test key length")?;
+        Ok(Keypair::from_secret_key(
+            &Secp256k1::new(),
+            &SecretKey::from_byte_array(bytes).map_err(|_| "invalid test key")?,
+        ))
+    }
+
+    async fn recovery_http(
+        state: AppState,
+        path: &str,
+        body: serde_json::Value,
+        source_header: bool,
+    ) -> Result<Response, String> {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json");
+        if source_header {
+            request = request.header("x-real-ip", "192.0.2.3");
+        }
+        let request = request
+            .body(Body::from(body.to_string()))
+            .map_err(|_| "bad test request")?;
+        test_router(state)
+            .oneshot(request)
+            .await
+            .map_err(|_| "test router failed".to_owned())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn integrated_recovery_uses_shared_storage_and_preserves_historical_fetch()
+    -> Result<(), String> {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/recovery-wire-v1.json"))
+                .map_err(|_| "bad fixture")?;
+        let mut request: recovery_prototype::StoreRequest =
+            serde_json::from_value(fixture["store"].clone()).map_err(|_| "bad store fixture")?;
+        let policy = recovery_prototype::RecoveryPolicy {
+            origin: request.grant.origin.clone(),
+            publisher: request.grant.publisher.clone(),
+            max_records: 1,
+            max_bytes: request.ciphertext_bytes,
+        };
+        let (directory, owner, mut state) =
+            test_state_with_capacity("integrated-recovery", 16 * 1024)?;
+        state.recovery = Some(policy.clone());
+        let stored = state
+            .storage
+            .store_recovery(policy, request.clone(), 100)
+            .await
+            .map_err(|e| format!("{e:?}"))?
+            .map_err(|e| format!("{e:?}"))?;
+        let clock = unix_time().map_err(|_| "clock")?;
+        let publisher = recovery_fixture_key(&fixture, "publisher_private_key")?;
+        let nostr = recovery_fixture_key(&fixture, "nostr_private_key")?;
+        request.timestamp = clock;
+        request.signature = Secp256k1::new()
+            .sign_schnorr_no_aux_rand(&recovery_prototype::store_digest(&request), &publisher)
+            .to_string();
+        let body = serde_json::to_value(&request).map_err(|_| "encode store")?;
+        // Retrying a stored record is permitted after expiry and at exact capacity.
+        let response = recovery_http(
+            state.clone(),
+            "/api/v1/arkade-recovery-records",
+            body.clone(),
+            true,
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["cache-control"],
+            "private, no-store, max-age=0"
+        );
+        let response = recovery_http(
+            state.clone(),
+            "/api/v1/arkade-recovery-records",
+            body.clone(),
+            false,
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let mut disabled = state.clone();
+        disabled.recovery = None;
+        assert_eq!(
+            recovery_http(disabled, "/api/v1/arkade-recovery-records", body, true)
+                .await?
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let mut fetch = recovery_prototype::FetchRequest {
+            owner: request.grant.owner.clone(),
+            after: 0,
+            snapshot: 0,
+            timestamp: clock,
+            signature: String::new(),
+        };
+        fetch.signature = Secp256k1::new()
+            .sign_schnorr_no_aux_rand(&recovery_prototype::fetch_digest(&fetch), &nostr)
+            .to_string();
+        let response = recovery_http(
+            state.clone(),
+            "/api/v1/arkade-recovery-records/fetch",
+            serde_json::to_value(&fetch).map_err(|_| "encode fetch")?,
+            true,
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|_| "read response")?;
+        let page: recovery_prototype::Page =
+            serde_json::from_slice(&bytes).map_err(|_| "decode response")?;
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].id, stored.id);
+        assert_eq!(page.records[0].ciphertext, request.ciphertext);
+        assert_eq!(page.next_after, None);
+        fetch.signature = "0".repeat(128);
+        assert_eq!(
+            recovery_http(
+                state.clone(),
+                "/api/v1/arkade-recovery-records/fetch",
+                serde_json::to_value(&fetch).map_err(|_| "encode fetch")?,
+                true
+            )
+            .await?
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        request.ciphertext = BASE64_STANDARD.encode(b"new record after expiry");
+        request.ciphertext_sha256 = hex::encode(Sha256::digest(b"new record after expiry"));
+        request.ciphertext_bytes =
+            u64::try_from(b"new record after expiry".len()).map_err(|_| "length")?;
+        request.signature = Secp256k1::new()
+            .sign_schnorr_no_aux_rand(&recovery_prototype::store_digest(&request), &publisher)
+            .to_string();
+        assert_eq!(
+            recovery_http(
+                state,
+                "/api/v1/arkade-recovery-records",
+                serde_json::to_value(&request).map_err(|_| "encode store")?,
+                true
+            )
+            .await?
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        owner.shutdown().await?;
+        let report = storage::verify_backup(&directory.join("backup.sqlite3"))?;
+        assert_eq!(report.recovery_records, 1);
+        assert_eq!(
+            report.recovery_bytes,
+            fixture["store"]["ciphertext_bytes"]
+                .as_u64()
+                .ok_or("fixture length")?
+        );
+        fs::remove_dir_all(directory).map_err(|_| "cleanup failed")?;
+        Ok(())
     }
 
     async fn send_test_json(
@@ -3048,6 +3353,41 @@ mod tests {
                 .await
                 .map_err(|_| "failed to read descriptor error response".to_owned())?;
             assert_eq!(body.as_ref(), nginx_return_body(config, status)?.as_bytes());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nginx_recovery_routes_keep_all_admission_bounds() -> Result<(), String> {
+        let config = include_str!("../deploy/nginx/recovery-backup.conf");
+        let zones = include_str!("../deploy/nginx/backup-server-http.conf");
+        for (path, operation, size, concurrency) in [
+            ("/api/v1/arkade-recovery-records", "store", "192k", 8),
+            ("/api/v1/arkade-recovery-records/fetch", "fetch", "4k", 24),
+        ] {
+            let location = nginx_exact_location(config, path)?;
+            for directive in [
+                "access_log off;".to_owned(),
+                "error_log stderr crit;".to_owned(),
+                "proxy_set_header X-Real-IP $remote_addr;".to_owned(),
+                "proxy_set_header X-Forwarded-For \"\";".to_owned(),
+                "proxy_set_header Forwarded \"\";".to_owned(),
+                "proxy_request_buffering on;".to_owned(),
+                "proxy_intercept_errors off;".to_owned(),
+                "if ($http_content_length = \"\") { return 400; }".to_owned(),
+                "if ($http_transfer_encoding != \"\") { return 400; }".to_owned(),
+                "proxy_read_timeout 15s;".to_owned(),
+                format!("client_max_body_size {size};"),
+                format!("limit_req zone=recovery_{operation}_all burst=64 nodelay;"),
+                format!("limit_conn recovery_{operation}_conn_all {concurrency};"),
+            ] {
+                assert!(
+                    location.lines().any(|line| line.trim() == directive),
+                    "{path}: {directive}"
+                );
+            }
+            assert!(zones.contains(&format!("zone=recovery_{operation}_all:")));
+            assert!(zones.contains(&format!("zone=recovery_{operation}_conn_all:")));
         }
         Ok(())
     }

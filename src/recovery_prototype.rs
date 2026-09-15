@@ -538,6 +538,126 @@ mod tests {
         req.signature = sign(owner, &fetch_digest(&req));
         req
     }
+    fn check_shared_envelope(fixture: &serde_json::Value, grant: &Grant, store: &StoreRequest) {
+        let envelope_bytes = B64.decode(&store.ciphertext).unwrap();
+        assert_eq!(
+            hex::encode(Sha256::digest(&envelope_bytes)),
+            fixture["digests"]["ciphertext"]
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&envelope_bytes).unwrap();
+        assert_eq!(envelope, fixture["envelope"]);
+        let event = &envelope["event"];
+        let serialized = serde_json::to_vec(&serde_json::json!([
+            0,
+            event["pubkey"],
+            event["created_at"],
+            event["kind"],
+            event["tags"],
+            event["content"]
+        ]))
+        .unwrap();
+        let event_digest: [u8; 32] = Sha256::digest(serialized).into();
+        assert_eq!(hex::encode(event_digest), fixture["digests"]["event"]);
+        verify(
+            event["pubkey"].as_str().unwrap(),
+            &event_digest,
+            event["sig"].as_str().unwrap(),
+        )
+        .unwrap();
+        let attestation = digest(&[
+            DOMAIN,
+            "sealed",
+            &grant.owner,
+            &hex::encode(grant_digest(grant)),
+            event["id"].as_str().unwrap(),
+        ]);
+        assert_eq!(hex::encode(attestation), fixture["digests"]["attestation"]);
+        verify(
+            &grant.publisher,
+            &attestation,
+            envelope["publisher_signature"].as_str().unwrap(),
+        )
+        .unwrap();
+        let plain = fixture["bundle_json"].as_str().unwrap();
+        assert_eq!(
+            hex::encode(Sha256::digest(plain.as_bytes())),
+            fixture["digests"]["plaintext"]
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(plain).unwrap(),
+            fixture["bundle"]
+        );
+    }
+
+    #[test]
+    fn shared_wire_conformance_vector() {
+        let raw = include_bytes!("../tests/fixtures/recovery-wire-v1.json");
+        assert_eq!(
+            hex::encode(Sha256::digest(raw)),
+            "4ce1053bb849e7bc0db7cd3702c1f623dcea5d60e45853ac1b5c4e0c224092c8"
+        );
+        let fixture: serde_json::Value = serde_json::from_slice(raw).unwrap();
+        assert_eq!(fixture["domain"], DOMAIN);
+        let grant: Grant = serde_json::from_value(fixture["grant"].clone()).unwrap();
+        let store: StoreRequest = serde_json::from_value(fixture["store"].clone()).unwrap();
+        let fetch: FetchRequest = serde_json::from_value(fixture["fetch"].clone()).unwrap();
+        for (name, actual) in [
+            ("grant", grant_digest(&grant)),
+            ("store", store_digest(&store)),
+            ("fetch", fetch_digest(&fetch)),
+        ] {
+            assert_eq!(fixture["digests"][name], hex::encode(actual));
+        }
+        assert_eq!(serde_json::to_value(&grant).unwrap(), fixture["grant"]);
+        assert_eq!(serde_json::to_value(&store).unwrap(), fixture["store"]);
+        assert_eq!(serde_json::to_value(&fetch).unwrap(), fixture["fetch"]);
+        let encoding = &fixture["scope_encoding"];
+        assert_eq!(
+            hex::encode(digest(&[
+                DOMAIN,
+                "scope",
+                encoding["message"].as_str().unwrap(),
+                encoding["proof"].as_str().unwrap(),
+                encoding["outputs_json"].as_str().unwrap()
+            ])),
+            encoding["digest"]
+        );
+        verify(&grant.owner, &grant_digest(&grant), &grant.signature).unwrap();
+        verify(&grant.publisher, &store_digest(&store), &store.signature).unwrap();
+        verify(&fetch.owner, &fetch_digest(&fetch), &fetch.signature).unwrap();
+        let (mut app, _) = self::fixture();
+        app.origin.clone_from(&grant.origin);
+        app.publisher.clone_from(&grant.publisher);
+        let receipt = store_record(&app, &store, 100).unwrap();
+        assert_eq!(receipt.id, 1);
+        let page = fetch_records(&app, &fetch, 100).unwrap();
+        assert_eq!(page.snapshot, 1);
+        assert!(page.next_after.is_none());
+        assert_eq!(
+            serde_json::to_value(&page.records[0]).unwrap(),
+            fixture["record"]
+        );
+        check_shared_envelope(&fixture, &grant, &store);
+        let mut changed = store.clone();
+        changed.grant.max_records -= 1;
+        assert_eq!(
+            store_record(&app, &changed, 100).err().unwrap().0,
+            StatusCode::UNAUTHORIZED
+        );
+        changed = store;
+        changed.ciphertext_bytes += 1;
+        assert_eq!(
+            store_record(&app, &changed, 100).err().unwrap().0,
+            StatusCode::UNAUTHORIZED
+        );
+        let mut changed = fetch;
+        changed.after += 1;
+        assert_eq!(
+            fetch_records(&app, &changed, 100).err().unwrap().0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
     #[test]
     fn exact_retry_survives_grant_expiry_but_new_append_does_not() {
         let (app, mut req) = fixture();

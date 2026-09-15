@@ -3,6 +3,11 @@
 Branch: `prototype/arkade-recovery` in `SatoshiPortal/BULL-metadata-backup`.
 Companion delegate: `prototype/encrypted-recovery` in `SatoshiPortal/fulmine`.
 
+The canonical [version-1 wire contract](https://github.com/SatoshiPortal/fulmine/blob/prototype/encrypted-recovery/docs/recovery-wire-v1.md)
+freezes identities, signed bytes and bundle fields. Its golden fixture is copied
+unchanged to `tests/fixtures/recovery-wire-v1.json`; the conformance test pins its
+SHA256 and verifies Go/Rust digests, signatures and opaque-storage round trips.
+
 This prototype adds a separate executable and SQLite database for encrypted
 delegated-refresh recovery records. The existing metadata server remains the
 default executable; this resource is not yet integrated into its production API.

@@ -300,18 +300,28 @@ fn store_record(app: &App, req: &StoreRequest, clock: u64) -> Result<Receipt, Er
         )
         .optional()
         .map_err(internal)?;
-    if prior.is_some_and(|value| value != grant_hash) {
+    if prior.as_ref().is_some_and(|value| value != &grant_hash) {
         return Err(Error(StatusCode::CONFLICT));
     }
-    let existing: Option<i64> = tx
+    let existing: Option<(i64, Vec<u8>, String)> = tx
         .query_row(
-            "SELECT id FROM recovery_records WHERE owner=? AND grant_id=? AND hash=?",
+            "SELECT id,ciphertext,grant_json FROM recovery_records WHERE owner=? AND grant_id=? AND hash=?",
             params![g.owner, g.id, req.ciphertext_sha256],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()
         .map_err(internal)?;
-    if let Some(id) = existing {
+    if let Some((id, stored_raw, stored_grant)) = existing {
+        let stored_grant: Grant = serde_json::from_str(&stored_grant).map_err(internal)?;
+        if prior.is_none() || stored_raw != raw || grant_digest(&stored_grant) != grant_digest(g) {
+            return Err(internal("persisted recovery record does not match retry"));
+        }
+        verify(
+            &stored_grant.owner,
+            &grant_digest(&stored_grant),
+            &stored_grant.signature,
+        )
+        .map_err(internal)?;
         return Ok(Receipt {
             id,
             ciphertext_sha256: req.ciphertext_sha256.clone(),
@@ -411,6 +421,21 @@ fn fetch_records(app: &App, req: &FetchRequest, clock: u64) -> Result<Page, Erro
     };
     if snapshot > latest || req.after > snapshot {
         return Err(Error(StatusCode::CONFLICT));
+    }
+    for anchor in [req.after, snapshot] {
+        if anchor != 0 {
+            let exists: bool = db
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE owner=? AND id=?)",
+                    params![req.owner, anchor],
+                    |r| r.get(0),
+                )
+                .map_err(internal)?;
+            if !exists {
+                return Err(Error(StatusCode::CONFLICT));
+            }
+        }
     }
     let mut query = db.conn.prepare("SELECT id,grant_json,ciphertext,hash FROM recovery_records WHERE owner=? AND id>? AND id<=? ORDER BY id LIMIT ?").map_err(internal)?;
     let rows = query
@@ -709,6 +734,140 @@ mod tests {
             fetch_records(&app, &fetch, 100).err().unwrap().0,
             StatusCode::CONFLICT
         );
+    }
+
+    #[test]
+    fn pagination_rejects_missing_anchors_after_newer_records_arrive() {
+        for missing in [8, 10] {
+            let (app, mut req) = fixture();
+            req.grant.max_records = 16;
+            for i in 1..=10u8 {
+                let raw = [i; 6];
+                req.ciphertext = B64.encode(raw);
+                req.ciphertext_sha256 = hex::encode(Sha256::digest(raw));
+                resign(&mut req);
+                store_record(&app, &req, 100).unwrap();
+            }
+            let first = fetch_records(&app, &fetch_request(&pair(1)), 100).unwrap();
+            assert_eq!(first.next_after, Some(8));
+            assert_eq!(first.snapshot, 10);
+            let mut fetch = fetch_request(&pair(1));
+            fetch.after = first.next_after.unwrap();
+            fetch.snapshot = first.snapshot;
+            fetch.signature = sign(&pair(1), &fetch_digest(&fetch));
+            app.db
+                .lock()
+                .unwrap()
+                .conn
+                .execute("DELETE FROM recovery_records WHERE id=?", [missing])
+                .unwrap();
+            req.ciphertext = B64.encode([11u8; 6]);
+            req.ciphertext_sha256 = hex::encode(Sha256::digest([11u8; 6]));
+            resign(&mut req);
+            assert_eq!(store_record(&app, &req, 100).unwrap().id, 11);
+            assert_eq!(
+                fetch_records(&app, &fetch, 100).err().unwrap().0,
+                StatusCode::CONFLICT,
+                "missing anchor {missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_retry_never_acknowledges_damaged_persisted_data() {
+        for damage in ["ciphertext", "grant_json", "grant_binding"] {
+            let (app, req) = fixture();
+            store_record(&app, &req, 100).unwrap();
+            let sql = match damage {
+                "ciphertext" => "UPDATE recovery_records SET ciphertext=x'00'",
+                "grant_json" => "UPDATE recovery_records SET grant_json='{}'",
+                "grant_binding" => "DELETE FROM recovery_grants",
+                _ => unreachable!(),
+            };
+            app.db.lock().unwrap().conn.execute(sql, []).unwrap();
+            assert_eq!(
+                store_record(&app, &req, 100).err().unwrap().0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "damaged {damage}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_retry_accepts_equivalent_authorization_but_rejects_corrupt_grant() {
+        let (app, mut req) = fixture();
+        let receipt = store_record(&app, &req, 100).unwrap();
+        req.grant.signature = Secp256k1::new()
+            .sign_schnorr_with_aux_rand(&grant_digest(&req.grant), &pair(1), &[42; 32])
+            .to_string();
+        req.signature = sign(&pair(2), &store_digest(&req));
+        assert_eq!(store_record(&app, &req, 100).unwrap().id, receipt.id);
+        for changed_digest in [false, true] {
+            let mut stored = req.grant.clone();
+            if changed_digest {
+                stored.scope = "33".repeat(32);
+                stored.signature = sign(&pair(1), &grant_digest(&stored));
+            } else {
+                stored.signature = "00".repeat(64);
+            }
+            app.db
+                .lock()
+                .unwrap()
+                .conn
+                .execute(
+                    "UPDATE recovery_records SET grant_json=?",
+                    [serde_json::to_string(&stored).unwrap()],
+                )
+                .unwrap();
+            assert_eq!(
+                store_record(&app, &req, 100).err().unwrap().0,
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
+    }
+
+    #[test]
+    fn retained_snapshot_excludes_later_appends_and_allows_completed_cursor() {
+        let (app, mut req) = fixture();
+        req.grant.max_records = 2;
+        resign(&mut req);
+        let receipt = store_record(&app, &req, 100).unwrap();
+        let mut fetch = fetch_request(&pair(1));
+        fetch.snapshot = u64::try_from(receipt.id).unwrap();
+        fetch.signature = sign(&pair(1), &fetch_digest(&fetch));
+        req.ciphertext = B64.encode(b"second");
+        req.ciphertext_sha256 = hex::encode(Sha256::digest(b"second"));
+        resign(&mut req);
+        store_record(&app, &req, 100).unwrap();
+        let page = fetch_records(&app, &fetch, 100).unwrap();
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].id, receipt.id);
+        assert_eq!(page.next_after, None);
+        fetch.after = fetch.snapshot;
+        fetch.signature = sign(&pair(1), &fetch_digest(&fetch));
+        assert!(fetch_records(&app, &fetch, 100).unwrap().records.is_empty());
+    }
+
+    #[test]
+    fn concurrent_exact_retries_preserve_receipt_and_consume_quota_once() {
+        let (app, req) = fixture();
+        let mut threads = Vec::new();
+        for _ in 0..16 {
+            let app = app.clone();
+            let req = req.clone();
+            threads.push(std::thread::spawn(move || {
+                store_record(&app, &req, 100).unwrap().id
+            }));
+        }
+        for thread in threads {
+            assert_eq!(thread.join().unwrap(), 1);
+        }
+        let db = app.db.lock().unwrap();
+        let counts: (u64, u64, u64) = db.conn.query_row(
+            "SELECT COUNT(*), SUM(length(ciphertext)), (SELECT COUNT(*) FROM recovery_grants) FROM recovery_records",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(counts, (1, 6, 1));
     }
 
     #[test]

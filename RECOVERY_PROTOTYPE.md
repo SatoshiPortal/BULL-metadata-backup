@@ -19,9 +19,13 @@ The server stores ciphertext and has no user decryption keys.
 - `POST /api/v1/arkade-recovery-records` accepts a user-authorized publisher's
   signed upload and returns a receipt after committing the exact ciphertext.
 - `POST /api/v1/arkade-recovery-records/fetch` requires the user's Nostr signature
-  and provides snapshot pagination. There is no public lookup token.
+  and provides snapshot pagination. Missing retained cursor or snapshot records
+  fail with a conflict, including after newer records arrive. There is no public
+  lookup token. These checks cannot prove that all historical records remain.
 - Exact upload retries are idempotent, including retries after grant expiry.
-  Grants, owner storage and total database capacity have bounded quotas.
+  A retry must still match the persisted ciphertext and verified grant before a
+  receipt is returned. Grants, owner storage and total database capacity have
+  bounded quotas.
 - A process lock prevents two instances from owning the same database.
 
 Run `cargo test --locked --bin arkade-recovery-prototype` for the authorization,

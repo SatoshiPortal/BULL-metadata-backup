@@ -682,7 +682,12 @@ mod tests {
     fn signed_cursor_boundaries_and_rollback() {
         let (app, req) = fixture();
         let row = store_record(&app, &req, 100).unwrap();
-        for (after, snapshot) in [(1, 0), (0, u64::try_from(row.id).unwrap() + 1), (u64::MAX, u64::MAX), (2, 1)] {
+        for (after, snapshot) in [
+            (1, 0),
+            (0, u64::try_from(row.id).unwrap() + 1),
+            (u64::MAX, u64::MAX),
+            (2, 1),
+        ] {
             let mut fetch = fetch_request(&pair(1));
             fetch.after = after;
             fetch.snapshot = snapshot;

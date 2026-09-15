@@ -1,0 +1,55 @@
+name: Recovery conformance
+
+on:
+  push:
+    branches: [master, prototype/arkade-recovery]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recovery-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-components:
+    name: Backend recovery components
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: backup-server
+          persist-credentials: false
+      - name: Check out pinned companion
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: SatoshiPortal/fulmine
+          # Update with the companion revision reviewed for this release pair.
+          ref: 616df980dc07d6e83363543c036193f5d057976e
+          path: fulmine
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: fulmine/go.mod
+          cache-dependency-path: fulmine/go.sum
+      - name: Load pinned Rust toolchain
+        working-directory: backup-server
+        run: rustup show active-toolchain
+      - name: Run required conformance and component checks
+        run: >-
+          python3 fulmine/test/recovery/backend_ci.py
+          --backup-root backup-server
+          --output "$RUNNER_TEMP/recovery-ci"
+      - name: Preserve component evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: backend-recovery-evidence
+          path: ${{ runner.temp }}/recovery-ci
+          if-no-files-found: error
+          retention-days: 14
